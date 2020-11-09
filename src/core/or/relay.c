@@ -81,6 +81,10 @@
 #include "feature/nodelist/routerlist.h"
 #include "core/or/scheduler.h"
 #include "feature/stats/rephist.h"
+#include "feature/split/cell_buffer.h"
+#include "feature/split/splitcommon.h"
+#include "feature/split/spliteval.h"
+#include "feature/split/splitor.h"
 
 #include "core/or/cell_st.h"
 #include "core/or/cell_queue_st.h"
@@ -223,14 +227,20 @@ circuit_update_channel_usage(circuit_t *circ, cell_t *cell)
  *  - If not recognized, then we need to relay it: append it to the appropriate
  *    cell_queue on <b>circ</b>.
  *
- * Return -<b>reason</b> on failure.
+ * Return -<b>reason</b> on failure or return 1 to indicate that an out-of-order
+ * split cell was buffered.
  */
 int
-circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
-                           cell_direction_t cell_direction)
+circuit_receive_relay_cell_impl(cell_t *cell, circuit_t *circ,
+                                cell_direction_t cell_direction,
+                                crypt_path_t* start_at)
 {
   channel_t *chan = NULL;
   crypt_path_t *layer_hint=NULL;
+  circuit_t* base = NULL;
+  circuit_t* split_expected_circ;
+  circuit_t* split_actual_circ = NULL;
+  int r;
   char recognized=0;
   int reason;
 
@@ -241,17 +251,60 @@ circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
   if (circ->marked_for_close)
     return 0;
 
-  if (relay_decrypt_cell(circ, cell, cell_direction, &layer_hint, &recognized)
-      < 0) {
+  if (cell_direction == CELL_DIRECTION_IN && CIRCUIT_IS_ORCIRC(circ)) {
+    /* are we a split circuit (middle node)? then we need to split here...
+     * (in fact, we cannot choose our actual circuit down below, as we need
+     * to encrypt the cell with the right code in relay_decrypt_cell) */
+    if ((base = split_is_relevant(circ, NULL))) {
+      subcircuit_t* next_subcirc =
+          split_get_next_subcirc(base, NULL, CELL_DIRECTION_IN);
+
+      if (!next_subcirc) {
+        log_warn(LD_CIRC, "Cannot split cell in client direction, as there "
+                 "is no valid split instruction. Closing...");
+        return -END_CIRC_REASON_INTERNAL;
+      }
+
+      split_actual_circ = next_subcirc->circ;
+      tor_assert(split_actual_circ);
+
+      log_debug(LD_CIRC, "Splitting relay backward cell: original circ was %p "
+                "(ID %u) new circ is %p (ID %u)",
+                TO_OR_CIRCUIT(circ), TO_OR_CIRCUIT(circ)->p_circ_id,
+                TO_OR_CIRCUIT(split_actual_circ),
+                TO_OR_CIRCUIT(split_actual_circ)->p_circ_id);
+
+      if (split_actual_circ->marked_for_close) {
+        log_warn(LD_CIRC, "New circ was marked for close, original circ was "
+                 "not. Closing original circ...");
+        circuit_mark_for_close(circ, END_CIRC_REASON_INTERNAL);
+        return 0;
+      }
+
+      tor_assert(TO_OR_CIRCUIT(split_actual_circ)->p_chan);
+      circ = split_actual_circ;
+      split_used_circuit(base, CELL_DIRECTION_IN);
+    }
+  }
+
+  if ((r = relay_decrypt_cell(&circ, cell, cell_direction, &layer_hint,
+      &recognized, start_at)) < 0) {
     log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
            "relay crypt failed. Dropping connection.");
     return -END_CIRC_REASON_INTERNAL;
+  } else if (r == 1) {
+    /* split cell was buffered */
+    return 1;
   }
 
   circuit_update_channel_usage(circ, cell);
 
   if (recognized) {
     edge_connection_t *conn = NULL;
+
+    //DEBUG-split
+    tor_assert(! (cell_direction == CELL_DIRECTION_IN &&
+                  CIRCUIT_IS_ORCIRC(circ)));
 
     if (circ->purpose == CIRCUIT_PURPOSE_PATH_BIAS_TESTING) {
       if (pathbias_check_probe_response(circ, cell) == -1) {
@@ -295,6 +348,52 @@ circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
 
   /* not recognized. pass it on. */
   if (cell_direction == CELL_DIRECTION_OUT) {
+    /* unrecognised, outward relay cells can only arrive on or_circuits */
+    tor_assert(CIRCUIT_IS_ORCIRC(circ));
+
+    /* are we a split circuit (middle node)? then we need to merge here... */
+    if ((base = split_is_relevant(circ, NULL))) {
+      subcircuit_t* next_subcirc =
+                split_get_next_subcirc(base, NULL, CELL_DIRECTION_OUT);
+      split_expected_circ = next_subcirc ? next_subcirc->circ : NULL;
+
+      split_rewrite_relay_early(TO_OR_CIRCUIT(circ), cell);
+
+      cell->circ_id = base->n_circ_id;
+      chan = base->n_chan;
+      tor_assert(chan);
+
+      if (circ != split_expected_circ) {
+        /* need to buffer */
+        log_debug(LD_CIRC, "Buffer relay forward cell received on wrong split "
+                  "circ %p (ID %u) [expected circ was %p (ID %u)]",
+                  TO_OR_CIRCUIT(circ), TO_OR_CIRCUIT(circ)->p_circ_id,
+                  split_expected_circ ?
+                       TO_OR_CIRCUIT(split_expected_circ) : NULL,
+                  split_expected_circ ?
+                       TO_OR_CIRCUIT(split_expected_circ)->p_circ_id : 0);
+        split_buffer_cell(TO_OR_CIRCUIT(circ)->subcirc, cell);
+        return 1;
+      }
+
+      log_debug(LD_CIRC, "Merging split relay forward cell: received on "
+                "circ %p (ID %u), forwarding via circ %p (ID %u)",
+                TO_OR_CIRCUIT(circ), TO_OR_CIRCUIT(circ)->p_circ_id,
+                TO_OR_CIRCUIT(base), base->n_circ_id);
+
+      if (base->marked_for_close) {
+        log_warn(LD_CIRC, "Base was marked for close, original circ was "
+                 "not. Closing base...");
+        circuit_mark_for_close(circ, END_CIRC_REASON_INTERNAL);
+        return 0;
+      }
+
+      tor_assert(base->n_chan);
+
+      circ = base;
+      split_used_circuit(base, CELL_DIRECTION_OUT);
+    }
+
     cell->circ_id = circ->n_circ_id; /* switch it */
     chan = circ->n_chan;
   } else if (! CIRCUIT_IS_ORIGIN(circ)) {
@@ -318,7 +417,8 @@ circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
     // XXXX Can this splice stuff be done more cleanly?
     if (! CIRCUIT_IS_ORIGIN(circ) &&
         TO_OR_CIRCUIT(circ)->rend_splice &&
-        cell_direction == CELL_DIRECTION_OUT) {
+        cell_direction == CELL_DIRECTION_OUT &&
+        !base) { /* exclude split circuits */
       or_circuit_t *splice_ = TO_OR_CIRCUIT(circ)->rend_splice;
       tor_assert(circ->purpose == CIRCUIT_PURPOSE_REND_ESTABLISHED);
       tor_assert(splice_->base_.purpose == CIRCUIT_PURPOSE_REND_ESTABLISHED);
@@ -346,7 +446,45 @@ circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
                                   * the cells. */
 
   append_cell_to_circuit_queue(circ, chan, cell, cell_direction, 0);
+
+#ifdef SPLIT_EVAL_DATARATE
+  if (CIRCUIT_IS_ORCIRC(circ)) {
+    or_circuit_t* or_circ = TO_OR_CIRCUIT(circ);
+    if (or_circ->split_eval_data.consider) {
+      split_eval_append_cell(&or_circ->split_eval_data, cell_direction,
+                             &cell->received, &circ->temp);
+    }
+  }
+#endif /* SPLIT_EVAL_DATARATE */
+
   return 0;
+}
+
+/** Wrapper for circuit_receive_relay_cell which is necessary due to the
+ * split module. (For handling buffered cells, we need to be able to
+ * define at which cpath we want to start decryption)
+ */
+int
+circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
+                           cell_direction_t cell_direction)
+{
+  int retval;
+  crypt_path_t* start_at = NULL;
+  tor_assert(circ);
+
+  if (CIRCUIT_IS_ORIGIN(circ))
+    start_at = TO_ORIGIN_CIRCUIT(circ)->cpath;
+
+  retval = circuit_receive_relay_cell_impl(cell, circ, cell_direction,
+                                           start_at);
+
+  if (retval == 0 &&
+      ((cell_direction == CELL_DIRECTION_OUT && CIRCUIT_IS_ORCIRC(circ)) ||
+       (cell_direction == CELL_DIRECTION_IN && CIRCUIT_IS_ORIGIN(circ))) ) {
+    split_handle_buffered_cells(circ);
+  }
+
+  return retval;
 }
 
 /** Package a relay cell from an edge:
@@ -365,8 +503,9 @@ circuit_package_relay_cell(cell_t *cell, circuit_t *circ,
     /* Circuit is marked; send nothing. */
     return 0;
   }
-
-  if (cell_direction == CELL_DIRECTION_OUT) {
+ 
+  if (cell_direction == CELL_DIRECTION_OUT) { 
+    
     chan = circ->n_chan;
     if (!chan) {
       log_warn(LD_BUG,"outgoing relay cell sent from %s:%d has n_chan==NULL."
@@ -524,6 +663,12 @@ relay_command_to_string(uint8_t command)
     case RELAY_COMMAND_INTRODUCE_ACK: return "INTRODUCE_ACK";
     case RELAY_COMMAND_EXTEND2: return "EXTEND2";
     case RELAY_COMMAND_EXTENDED2: return "EXTENDED2";
+    case RELAY_COMMAND_SPLIT_SET_COOKIE: return "SPLIT_SET_COOKIE";
+    case RELAY_COMMAND_SPLIT_COOKIE_SET: return "SPLIT_COOKIE_SET";
+    case RELAY_COMMAND_SPLIT_JOIN: return "SPLIT_JOIN";
+    case RELAY_COMMAND_SPLIT_JOINED: return "SPLIT_JOINED";
+    case RELAY_COMMAND_SPLIT_INSTRUCTION: return "SPLIT_INSTRUCTION";
+    case RELAY_COMMAND_SPLIT_INFO: return "SPLIT_INFO";
     default:
       tor_snprintf(buf, sizeof(buf), "Unrecognized relay command %u",
                    (unsigned)command);
@@ -549,6 +694,8 @@ relay_send_command_from_edge_,(streamid_t stream_id, circuit_t *circ,
   cell_t cell;
   relay_header_t rh;
   cell_direction_t cell_direction;
+  circuit_t* base = NULL;
+  circuit_t* split_actual_circ;
   /* XXXX NM Split this function into a separate versions per circuit type? */
 
   tor_assert(circ);
@@ -558,11 +705,49 @@ relay_send_command_from_edge_,(streamid_t stream_id, circuit_t *circ,
   cell.command = CELL_RELAY;
   if (CIRCUIT_IS_ORIGIN(circ)) {
     tor_assert(cpath_layer);
-    cell.circ_id = circ->n_circ_id;
+
+    if ((base = split_is_relevant(circ, cpath_layer))) {
+      crypt_path_t* base_cpath_dest = base == circ ? cpath_layer :
+              split_find_equal_cpath(base, cpath_layer);
+
+      subcircuit_t* next_subcirc = split_get_next_subcirc(base,
+              base_cpath_dest, CELL_DIRECTION_OUT);
+
+      if (!next_subcirc) {
+        /* currently simply close the circuit */
+        log_warn(LD_CIRC, "Cannot split outgoing cell, as there "
+                 "is no valid split instruction. Closing...");
+        circuit_mark_for_close(circ, END_CIRC_REASON_INTERNAL);
+        return -1;
+      }
+
+      split_actual_circ = next_subcirc->circ;
+
+      log_debug(LD_CIRC, "Splitting relay forward cell: original circ was %p "
+                "(ID %u) new circ is %p (ID %u)",
+                TO_ORIGIN_CIRCUIT(circ), circ->n_circ_id,
+                TO_ORIGIN_CIRCUIT(split_actual_circ),
+                split_actual_circ->n_circ_id);
+
+      /* adapt destination cpath info */
+      if (split_actual_circ == base)
+        cpath_layer = base_cpath_dest;
+      else if (split_actual_circ != circ)
+        cpath_layer = split_find_equal_cpath(split_actual_circ, cpath_layer);
+
+    } else {
+      /* no split circuit... */
+      split_actual_circ = circ;
+    }
+
+    cell.circ_id = split_actual_circ->n_circ_id;
     cell_direction = CELL_DIRECTION_OUT;
   } else {
     tor_assert(! cpath_layer);
-    cell.circ_id = TO_OR_CIRCUIT(circ)->p_circ_id;
+    /* relay cells sent from a potential split middle node are not split,
+     * thus, don't consider splitting here */
+    split_actual_circ = circ;
+    cell.circ_id = TO_OR_CIRCUIT(split_actual_circ)->p_circ_id;
     cell_direction = CELL_DIRECTION_IN;
   }
 
@@ -582,17 +767,18 @@ relay_send_command_from_edge_,(streamid_t stream_id, circuit_t *circ,
 
   /* If we are sending an END cell and this circuit is used for a tunneled
    * directory request, advance its state. */
+  //TODO-split need to handle these?
   if (relay_command == RELAY_COMMAND_END && circ->dirreq_id)
     geoip_change_dirreq_state(circ->dirreq_id, DIRREQ_TUNNELED,
                               DIRREQ_END_CELL_SENT);
 
-  if (cell_direction == CELL_DIRECTION_OUT && circ->n_chan) {
+  if (cell_direction == CELL_DIRECTION_OUT && split_actual_circ->n_chan) {
     /* if we're using relaybandwidthrate, this conn wants priority */
-    channel_timestamp_client(circ->n_chan);
+    channel_timestamp_client(split_actual_circ->n_chan);
   }
 
   if (cell_direction == CELL_DIRECTION_OUT) {
-    origin_circuit_t *origin_circ = TO_ORIGIN_CIRCUIT(circ);
+    origin_circuit_t *origin_circ = TO_ORIGIN_CIRCUIT(split_actual_circ);
     if (origin_circ->remaining_relay_early_cells > 0 &&
         (relay_command == RELAY_COMMAND_EXTEND ||
          relay_command == RELAY_COMMAND_EXTEND2 ||
@@ -633,12 +819,83 @@ relay_send_command_from_edge_,(streamid_t stream_id, circuit_t *circ,
     circuit_sent_valid_data(origin_circ, rh.length);
   }
 
-  if (circuit_package_relay_cell(&cell, circ, cell_direction, cpath_layer,
-                                 stream_id, filename, lineno) < 0) {
+  split_used_circuit(base, cell_direction);
+
+#ifdef SPLIT_EVAL
+  switch (relay_command) {
+    case RELAY_COMMAND_BEGIN:
+      SPLIT_MEASURE(TO_ORIGIN_CIRCUIT(circ), circ_begin_sent);
+      break;
+    case RELAY_COMMAND_SPLIT_SET_COOKIE:
+      SPLIT_MEASURE(TO_ORIGIN_CIRCUIT(circ), split_set_cookie_sent);
+      break;
+    case RELAY_COMMAND_SPLIT_COOKIE_SET:
+      SPLIT_MEASURE(TO_OR_CIRCUIT(circ), split_cookie_set_sent);
+      break;
+    case RELAY_COMMAND_SPLIT_JOIN:
+      SPLIT_MEASURE(TO_ORIGIN_CIRCUIT(circ), split_join_sent);
+      break;
+    case RELAY_COMMAND_SPLIT_JOINED:
+      SPLIT_MEASURE(TO_OR_CIRCUIT(circ), split_joined_sent);
+      break;
+    case RELAY_COMMAND_SPLIT_INSTRUCTION:
+      SPLIT_MMEASURE(TO_ORIGIN_CIRCUIT(circ), split_instruction_sent,
+                     SPLIT_EVAL_INSTRUCTIONS);
+      break;
+    case RELAY_COMMAND_SPLIT_INFO:
+      SPLIT_MMEASURE(TO_ORIGIN_CIRCUIT(circ), split_info_sent,
+                     SPLIT_EVAL_INSTRUCTIONS);
+      break;
+    case RELAY_COMMAND_SPLIT_EVAL:
+      SPLIT_MEASURE(TO_ORIGIN_CIRCUIT(circ), circ_eval_sent);
+      break;
+  }
+#endif /* SPLIT_EVAL */
+
+  if (circuit_package_relay_cell(&cell, split_actual_circ, cell_direction,
+                                 cpath_layer, stream_id, filename,
+                                 lineno) < 0) {
     log_warn(LD_BUG,"circuit_package_relay_cell failed. Closing.");
-    circuit_mark_for_close(circ, END_CIRC_REASON_INTERNAL);
+    circuit_mark_for_close(split_actual_circ, END_CIRC_REASON_INTERNAL);
     return -1;
   }
+
+#ifdef SPLIT_EVAL
+  switch (relay_command) {
+    case RELAY_COMMAND_EXTEND:
+    case RELAY_COMMAND_EXTEND2:
+      SPLIT_MCOPY(TO_ORIGIN_CIRCUIT(circ), circ_extend_tobuf,
+                  SPLIT_EVAL_EXTEND, &circ->temp);
+      break;
+    case RELAY_COMMAND_BEGIN:
+      SPLIT_COPY(TO_ORIGIN_CIRCUIT(circ), circ_begin_tobuf, &circ->temp);
+      break;
+    case RELAY_COMMAND_SPLIT_SET_COOKIE:
+      SPLIT_COPY(TO_ORIGIN_CIRCUIT(circ), split_set_cookie_tobuf,
+                 &circ->temp);
+      break;
+    case RELAY_COMMAND_SPLIT_COOKIE_SET:
+      SPLIT_COPY(TO_OR_CIRCUIT(circ), split_cookie_set_tobuf, &circ->temp);
+      break;
+    case RELAY_COMMAND_SPLIT_JOIN:
+      SPLIT_COPY(TO_ORIGIN_CIRCUIT(circ), split_join_tobuf, &circ->temp);
+      break;
+    case RELAY_COMMAND_SPLIT_JOINED:
+      SPLIT_COPY(TO_OR_CIRCUIT(circ), split_joined_tobuf, &circ->temp);
+      break;
+    case RELAY_COMMAND_SPLIT_INSTRUCTION:
+      SPLIT_MCOPY(TO_ORIGIN_CIRCUIT(circ), split_instruction_tobuf,
+                  SPLIT_EVAL_INSTRUCTIONS, &circ->temp);
+      break;
+    case RELAY_COMMAND_SPLIT_INFO:
+      SPLIT_MCOPY(TO_ORIGIN_CIRCUIT(circ), split_info_tobuf,
+                  SPLIT_EVAL_INSTRUCTIONS, &circ->temp);
+      break;
+    case RELAY_COMMAND_SPLIT_EVAL:
+      SPLIT_COPY(TO_ORIGIN_CIRCUIT(circ), circ_eval_tobuf, &circ->temp);
+  }
+#endif /* SPLIT_EVAL */
+
   return 0;
 }
 
@@ -1320,6 +1577,15 @@ connection_edge_process_relay_cell_not_open(
     }
     CONNECTION_AP_EXPECT_NONPENDING(entry_conn);
     conn->base_.state = AP_CONN_STATE_OPEN;
+
+    SPLIT_MEASURE(TO_ORIGIN_CIRCUIT(circ), circ_connected_recv);
+    SPLIT_COPY(TO_ORIGIN_CIRCUIT(circ), circ_connected_frombuf, &cell->received);
+
+    //TODO-split move to better location?
+    if (TO_ORIGIN_CIRCUIT(circ)->initiated_by_user) {
+      split_eval_get_routerset(TO_ORIGIN_CIRCUIT(circ));
+    }
+
     log_info(LD_APP,"'connected' received for circid %u streamid %d "
              "after %d seconds.",
              (unsigned)circ->n_circ_id,
@@ -1703,6 +1969,8 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
         return 0;
       }
       log_debug(domain,"Got an extended cell! Yay.");
+      SPLIT_MCOPY(TO_ORIGIN_CIRCUIT(circ), circ_extended_frombuf,
+                  SPLIT_EVAL_EXTEND, &cell->received);
       {
         extended_cell_t extended_cell;
         if (extended_cell_parse(&extended_cell, rh.command,
@@ -1944,6 +2212,25 @@ connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
                               rh.command, rh.length,
                               cell->payload+RELAY_HEADER_SIZE);
       return 0;
+    case RELAY_COMMAND_SPLIT_SET_COOKIE:
+    case RELAY_COMMAND_SPLIT_COOKIE_SET:
+    case RELAY_COMMAND_SPLIT_JOIN:
+    case RELAY_COMMAND_SPLIT_JOINED:
+    case RELAY_COMMAND_SPLIT_INSTRUCTION:
+    case RELAY_COMMAND_SPLIT_INFO:
+      split_process_relay_cell(circ, layer_hint, cell,
+                               rh.command, rh.length,
+                               cell->payload+RELAY_HEADER_SIZE);
+        return 0;
+    case RELAY_COMMAND_SPLIT_EVAL:
+      if (CIRCUIT_IS_ORCIRC(circ)) {
+        log_info(LD_CIRC, "Received SPLIT_EVAL cell.");
+        SPLIT_MEASURE(TO_OR_CIRCUIT(circ), circ_eval_recv);
+        SPLIT_COPY(TO_OR_CIRCUIT(circ), circ_eval_frombuf, &cell->received);
+        tor_assert(rh.length == 1);
+        split_eval_consider(circ, *(cell->payload+RELAY_HEADER_SIZE));
+        return 0;
+      }
   }
   log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
          "Received unknown relay command %d. Perhaps the other side is using "
@@ -2013,6 +2300,17 @@ connection_edge_package_raw_inbuf(edge_connection_t *conn, int package_partial,
     return -1;
   }
 
+  if (CIRCUIT_IS_ORIGIN(circ)) {
+    tor_assert(circ->purpose != CIRCUIT_PURPOSE_SPLIT_JOIN);
+    tor_assert(circ == split_get_base(circ)); //DEBUG-split
+  }
+  /* edge connections are never relevant for split or_circuits, as the
+   * exit is not split and as the relay cells directed to the middle node
+   * are not split. */
+
+  /* SPLIT_JOIN circuits cannot have streams attached to them and they rely
+   * on their base circuit for packaging windows beyond their merging node;
+   * thus, check window for the base circuit here. */
   if (circuit_consider_stop_edge_reading(circ, cpath_layer))
     return 0;
 
@@ -2473,6 +2771,10 @@ cell_queue_append_packed_copy(circuit_t *circ, cell_queue_t *queue,
   copy->inserted_timestamp = monotime_coarse_get_stamp();
 
   cell_queue_append(queue, copy);
+
+#ifdef SPLIT_EVAL
+  clock_gettime(CLOCK_MONOTONIC, &circ->temp);
+#endif /* SPLIT_EVAL */
 }
 
 /** Initialize <b>queue</b> as an empty cell queue. */
@@ -2598,7 +2900,7 @@ static time_t last_time_under_memory_pressure = 0;
 
 /** Check whether we've got too much space used for cells.  If so,
  * call the OOM handler and return 1.  Otherwise, return 0. */
-STATIC int
+int
 cell_queues_check_size(void)
 {
   time_t now = time(NULL);
@@ -2606,6 +2908,7 @@ cell_queues_check_size(void)
   alloc += half_streams_get_total_allocation();
   alloc += buf_get_total_allocation();
   alloc += tor_compress_get_total_allocation();
+  alloc += split_cell_buffer_get_total_allocation();
   const size_t rend_cache_total = rend_cache_get_total_allocation();
   alloc += rend_cache_total;
   const size_t geoip_client_cache_total =
@@ -2721,11 +3024,12 @@ channel_unlink_all_circuits(channel_t *chan, smartlist_t *circuits_out)
  * Returns the number of streams whose status we changed.
  */
 static int
-set_streams_blocked_on_circ(circuit_t *circ, channel_t *chan,
-                            int block, streamid_t stream_id)
+set_streams_blocked_on_circ_impl(circuit_t *circ, channel_t *chan,
+                                 int block, streamid_t stream_id)
 {
   edge_connection_t *edge = NULL;
   int n = 0;
+
   if (circ->n_chan == chan) {
     circ->streams_blocked_on_n_chan = block;
     if (CIRCUIT_IS_ORIGIN(circ))
@@ -2763,6 +3067,49 @@ set_streams_blocked_on_circ(circuit_t *circ, channel_t *chan,
   }
 
   return n;
+}
+
+/** Wrapper for set_streams_blocked_on_circ_impl (which was former named
+ * set_streams_blocked_on_circ) that is necessary for correctly blocking and
+ * unblocking the base of a split circuit.
+ * (Parameters as for set_streams_blocked_on_circ_impl)
+ */
+static int
+set_streams_blocked_on_circ(circuit_t *circ, channel_t *chan,
+                            int block, streamid_t stream_id)
+{
+  circuit_t* base;
+  int tmp = 0;
+
+  if (circ && CIRCUIT_IS_ORIGIN(circ) && (base = split_get_base_(circ))) {
+    tor_assert(circ->n_chan == chan);
+
+    if (block) {
+      if (!circ->streams_blocked_on_n_chan)
+        split_base_inc_blocked(base);
+
+      if (circ != base) /* need to block base */
+        tmp = set_streams_blocked_on_circ_impl(base, base->n_chan, 1,
+                                               stream_id);
+
+      return tmp + set_streams_blocked_on_circ_impl(circ, chan, 1, stream_id);
+    } else { /* unblock */
+      if (circ->streams_blocked_on_n_chan)
+        split_base_dec_blocked(base);
+
+      if (split_base_should_unblock(base)) /* need to unblock base */
+        tmp = set_streams_blocked_on_circ_impl(base, base->n_chan, 0,
+                                               stream_id);
+
+      if (circ != base) /* we can unblock circ */
+        tmp += set_streams_blocked_on_circ_impl(circ, chan, 0, stream_id);
+
+      return tmp;
+    } /* endif block */
+  } else {
+    return set_streams_blocked_on_circ_impl(circ, chan, block, stream_id);
+  }
+
 }
 
 /** Extract the command from a packed cell. */
@@ -3161,6 +3508,8 @@ circuit_clear_cell_queue(circuit_t *circ, channel_t *chan)
 static int
 circuit_queue_streams_are_blocked(circuit_t *circ)
 {
+  circ = split_get_base(circ);
+
   if (CIRCUIT_IS_ORIGIN(circ)) {
     return circ->streams_blocked_on_n_chan;
   } else {

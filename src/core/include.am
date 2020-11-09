@@ -126,6 +126,7 @@ LIBTOR_APP_A_SOURCES = 				\
 	src/feature/rend/rendmid.c		\
 	src/feature/rend/rendparse.c		\
 	src/feature/rend/rendservice.c		\
+	src/feature/split/spliteval.c		\
 	src/feature/stats/geoip_stats.c		\
 	src/feature/stats/rephist.c		\
 	src/feature/stats/predict_ports.c
@@ -165,11 +166,29 @@ if BUILD_MODULE_DIRAUTH
 LIBTOR_APP_A_SOURCES += $(MODULE_DIRAUTH_SOURCES)
 endif
 
+MODULE_SPLIT_SOURCES =						\
+	src/feature/split/cell_buffer.c			\
+	src/feature/split/splitclient.c			\
+	src/feature/split/splitcommon.c			\
+	src/feature/split/splitor.c				\
+	src/feature/split/splitstrategy.c		\
+	src/feature/split/splitutil.c			\
+	src/feature/split/subcirc_list.c		\
+	src/feature/split/dirichlet/mt.c		 \
+	src/feature/split/dirichlet/mydirichlet.c	\
+	src/feature/split/dirichlet/gsl_rng.c	\
+	src/feature/split/dirichlet/gausszig.c 
+
+if BUILD_MODULE_SPLIT
+LIBTOR_APP_A_SOURCES += $(MODULE_SPLIT_SOURCES)
+endif
+
 src_core_libtor_app_a_SOURCES = $(LIBTOR_APP_A_SOURCES)
 if UNITTESTS_ENABLED
 
 # Add the sources of the modules that are needed for tests to work here.
 LIBTOR_APP_TESTING_A_SOURCES += $(MODULE_DIRAUTH_SOURCES)
+LIBTOR_APP_TESTING_A_SOURCES += $(MODULE_SPLIT_SOURCES)
 
 src_core_libtor_app_testing_a_SOURCES = $(LIBTOR_APP_TESTING_A_SOURCES)
 else
@@ -370,6 +389,22 @@ noinst_HEADERS +=					\
 	src/feature/rend/rendmid.h			\
 	src/feature/rend/rendparse.h			\
 	src/feature/rend/rendservice.h			\
+	src/feature/split/cell_buffer.h			\
+	src/feature/split/split_data_st.h		\
+	src/feature/split/split_instruction_st.h\
+	src/feature/split/splitclient.h			\
+	src/feature/split/splitcommon.h			\
+	src/feature/split/splitdefines.h		\
+	src/feature/split/spliteval.h			\
+	src/feature/split/splitor.h				\
+	src/feature/split/splitstrategy.h		\
+	src/feature/split/splitutil.h			\
+	src/feature/split/subcirc_list.h		\
+	src/feature/split/subcircuit_st.h		\
+	src/feature/split/dirichlet/gsl_inline.h		\
+	src/feature/split/dirichlet/gsl_rng.h               \
+	src/feature/split/dirichlet/gsl_types.h               \
+	src/feature/split/dirichlet/mydirichlet.h               \
 	src/feature/stats/geoip_stats.h			\
 	src/feature/stats/rephist.h			\
 	src/feature/stats/predict_ports.h

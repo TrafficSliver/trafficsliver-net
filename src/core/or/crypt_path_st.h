@@ -8,6 +8,7 @@
 #define CRYPT_PATH_ST_H
 
 #include "core/or/relay_crypto_st.h"
+#include "feature/split/split_data_st.h"
 struct crypto_dh_t;
 
 #define CRYPT_PATH_MAGIC 0x70127012u
@@ -65,6 +66,14 @@ struct crypt_path_t {
                        * at this step? */
   int deliver_window; /**< How many cells are we willing to deliver originating
                        * at this step? */
+
+  /** Information on a split circuit that is merged at this middle node */
+  split_data_t* split_data;
+
+  /** Reference to the sub-circuit information under which the
+   * superordinated origin circuit is part of split_data structure
+   * referenced above. */
+  subcircuit_t* subcirc;
 };
 
 #endif

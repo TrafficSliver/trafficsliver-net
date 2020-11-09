@@ -127,6 +127,8 @@
 #include <sys/un.h>
 #endif
 
+#include <ifaddrs.h>
+
 #include "feature/dircommon/dir_connection_st.h"
 #include "feature/control/control_connection_st.h"
 #include "core/or/entry_connection_st.h"
@@ -1804,13 +1806,17 @@ connection_handle_listener_read(connection_t *conn, int new_type)
       newconn->address = tor_addr_to_str_dup(&addr);
     }
 
-    if (new_type == CONN_TYPE_AP && conn->socket_family != AF_UNIX) {
-      log_info(LD_NET, "New SOCKS connection opened from %s.",
-               fmt_and_decorate_addr(&addr));
+    if (new_type == CONN_TYPE_AP) {
+      if (conn->socket_family != AF_UNIX) {
+        log_info(LD_NET, "New SOCKS connection opened from %s.",
+                 fmt_and_decorate_addr(&addr));
+      } else {
+        log_info(LD_NET, "New SOCKS AF_UNIX connection opened");
+      }
+
+      newconn->initiated_by_user = 1;
     }
-    if (new_type == CONN_TYPE_AP && conn->socket_family == AF_UNIX) {
-      log_info(LD_NET, "New SOCKS AF_UNIX connection opened");
-    }
+
     if (new_type == CONN_TYPE_CONTROL) {
       log_notice(LD_CONTROL, "New control connection opened from %s.",
                  fmt_and_decorate_addr(&addr));
@@ -1911,6 +1917,26 @@ connection_init_accepted_conn(connection_t *conn,
   return 0;
 }
 
+static int
+bind_socket_to_if(tor_socket_t s, const char* if_name, sa_family_t family)
+{
+  tor_assert(if_name);
+  tor_assert(strcmp(if_name, "") != 0);
+
+#ifdef __linux__
+  (void)family;
+  return setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, (const void*) if_name,
+                    IFNAMSIZ);
+#elif defined(__APPLE__)
+  int idx = if_nametoindex(if_name);
+  if (idx < 0) return -1;
+  int option = family == AF_INET ? IP_BOUND_IF : IPV6_BOUND_IF;
+  return setsockopt(s, IPPROTO_TCP, option, &idx, sizeof(idx));
+#else
+#error "No implementation for binding a TCP socket to a device"
+#endif
+}
+
 /** Take conn, make a nonblocking socket; try to connect to
  * sa, binding to bindaddr if sa is not localhost. If fail, return -1 and if
  * applicable put your best guess about errno into *<b>socket_error</b>.
@@ -1972,6 +1998,22 @@ connection_connect_sockaddr,(connection_t *conn,
   if (make_socket_reuseable(s) < 0) {
     log_warn(LD_NET, "Error setting SO_REUSEADDR flag on new connection: %s",
              tor_socket_strerror(errno));
+  }
+
+  if (strcmp(conn->if_name, "") != 0) {
+    /* we assume that bindaddr was set to a valid address for the interface
+     * conn->if_name */
+    tor_assert(bindaddr);
+    tor_assert(proto == IPPROTO_TCP);
+
+    if (bind_socket_to_if(s, conn->if_name, protocol_family) < 0) {
+      log_warn(LD_NET, "Error binding socket %d to interface %s: %s",
+               s, conn->if_name, tor_socket_strerror(errno));
+      return -1;
+    }
+
+    log_debug(LD_NET, "Successfully bound socket %d to interface %s",
+              s, conn->if_name);
   }
 
   /*
@@ -2144,6 +2186,61 @@ conn_get_outbound_address(sa_family_t family,
   return ext_addr;
 }
 
+/** For a given interface name (<b>if_name</b>), find an address of
+ * <b>family</b> to bind to, write it to <b>bindaddr</b> and return
+ * the length of bindaddr.
+ */
+static int
+interface_get_bind_address(const char* if_name, sa_family_t family,
+                           struct sockaddr *bindaddr)
+{
+  struct ifaddrs *ifaddr, *ifa;
+  int bindaddr_len = 0;
+  tor_assert(if_name);
+  tor_assert(bindaddr);
+  tor_assert(family == AF_INET || family == AF_INET6);
+
+  if (getifaddrs(&ifaddr) < 0) {
+    log_warn(LD_NET, "Error while calling getifaddrs(): %s",
+             tor_socket_strerror(errno));
+    return -1;
+  }
+
+  for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+
+    if (strcmp(ifa->ifa_name, if_name) != 0) {
+      continue;
+    }
+
+    if (ifa->ifa_addr == NULL) {
+      continue;
+    }
+
+    if (ifa->ifa_addr->sa_family != family) {
+      continue;
+    }
+
+    /* found */
+    bindaddr_len = family == AF_INET ? sizeof(struct sockaddr_in) :
+        sizeof(struct sockaddr_in6);
+    memcpy(bindaddr, ifa->ifa_addr, bindaddr_len);
+    log_debug(LD_NET, "Found address to bind to (interface %s, family %u),",
+              if_name, family);
+    break;
+  }
+
+  freeifaddrs(ifaddr);
+
+  if (!bindaddr_len) {
+    /* not found */
+    log_warn(LD_NET, "Not able to find an address to bind to (interface %s, "
+             "family %u)", if_name, family);
+    return -1;
+  }
+
+  return bindaddr_len;
+}
+
 /** Take conn, make a nonblocking socket; try to connect to
  * addr:port (port arrives in *host order*). If fail, return -1 and if
  * applicable put your best guess about errno into *<b>socket_error</b>.
@@ -2170,7 +2267,18 @@ connection_connect(connection_t *conn, const char *address,
    */
   connection_connect_log_client_use_ip_version(conn);
 
-  if (!tor_addr_is_loopback(addr)) {
+  if (strcmp(conn->if_name, "") != 0) {
+    /* we have specified an interface to use for conn,
+     * so find an address to bind to */
+    if ((bind_addr_len = interface_get_bind_address(conn->if_name,
+         tor_addr_family(addr), (struct sockaddr*)&bind_addr_ss)) < 0) {
+      log_warn(LD_NET, "Cannot get bind address for interface %s",
+               conn->if_name);
+      return -1;
+    }
+
+    bind_addr = (struct sockaddr *)&bind_addr_ss;
+  } else if (!tor_addr_is_loopback(addr)) {
     const tor_addr_t *ext_addr = NULL;
     ext_addr = conn_get_outbound_address(tor_addr_family(addr), get_options(),
                                          conn->type);

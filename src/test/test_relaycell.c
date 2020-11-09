@@ -96,6 +96,7 @@ helper_create_origin_circuit(int purpose, int flags)
   circ->cpath->package_window = circuit_initial_package_window();
   circ->cpath->deliver_window = CIRCWINDOW_START;
   circ->cpath->prev = circ->cpath;
+  circ->cpath->next = circ->cpath;
   /* Create a default HS identifier. */
   circ->hs_ident = tor_malloc_zero(sizeof(hs_ident_circuit_t));
 

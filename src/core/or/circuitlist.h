@@ -125,7 +125,10 @@
  *  actual needed HS purpose. */
 #define CIRCUIT_PURPOSE_HS_VANGUARDS 23
 
-#define CIRCUIT_PURPOSE_MAX_ 23
+/** Circuit that was created to join an existing split-circuit */
+#define CIRCUIT_PURPOSE_SPLIT_JOIN 24
+
+#define CIRCUIT_PURPOSE_MAX_ 24
 /** A catch-all for unrecognized purposes. Currently we don't expect
  * to make or see any circuits with this purpose. */
 #define CIRCUIT_PURPOSE_UNKNOWN 255
@@ -228,6 +231,7 @@ int circuit_count_pending_on_channel(channel_t *chan);
 void assert_cpath_layer_ok(const crypt_path_t *cp);
 MOCK_DECL(void, assert_circuit_ok,(const circuit_t *c));
 void circuit_free_all(void);
+void circuit_free_cpath_node(crypt_path_t *victim);
 void circuits_handle_oom(size_t current_allocation);
 
 void circuit_clear_testing_cell_stats(circuit_t *circ);

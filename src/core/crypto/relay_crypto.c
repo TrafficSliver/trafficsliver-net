@@ -12,6 +12,7 @@
 #include "core/crypto/hs_ntor.h" // for HS_NTOR_KEY_EXPANSION_KDF_OUT_LEN
 #include "core/or/relay.h"
 #include "core/crypto/relay_crypto.h"
+#include "feature/split/splitcommon.h"
 
 #include "core/or/cell_st.h"
 #include "core/or/or_circuit_st.h"
@@ -105,25 +106,37 @@ relay_crypt_one_payload(crypto_cipher_t *cipher, uint8_t *in)
  * *layer_hint to the hop that recognized it.
  *
  * Return -1 to indicate that we should mark the circuit for close,
- * else return 0.
+ * return 1 to indicate that an out-of-order split cell was buffered.
+ * Else, return 0.
+ *
+ * (split module:
+ *    - change parameter *circ to **circ, to be able to directly
+ *      amend the receiving circuit as we detect it
+ *    - add parameter <b>start_at</b> to define at which cpath to start
+ *      decrypting (chosen automatically if NULL)
+ *      )
  */
 int
-relay_decrypt_cell(circuit_t *circ, cell_t *cell,
+relay_decrypt_cell(circuit_t **circ, cell_t *cell,
                    cell_direction_t cell_direction,
-                   crypt_path_t **layer_hint, char *recognized)
+                   crypt_path_t **layer_hint, char *recognized,
+                   crypt_path_t *start_at)
 {
   relay_header_t rh;
 
-  tor_assert(circ);
+  tor_assert(*circ);
   tor_assert(cell);
   tor_assert(recognized);
   tor_assert(cell_direction == CELL_DIRECTION_IN ||
              cell_direction == CELL_DIRECTION_OUT);
 
   if (cell_direction == CELL_DIRECTION_IN) {
-    if (CIRCUIT_IS_ORIGIN(circ)) { /* We're at the beginning of the circuit.
+    if (CIRCUIT_IS_ORIGIN(*circ)) { /* We're at the beginning of the circuit.
                                     * We'll want to do layered decrypts. */
-      crypt_path_t *thishop, *cpath = TO_ORIGIN_CIRCUIT(circ)->cpath;
+      crypt_path_t *thishop, *cpath = start_at ? start_at :
+                                        TO_ORIGIN_CIRCUIT(*circ)->cpath;
+      split_data_t* split_data;
+      circuit_t* base = NULL;
       thishop = cpath;
       if (thishop->state != CPATH_STATE_OPEN) {
         log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
@@ -132,6 +145,20 @@ relay_decrypt_cell(circuit_t *circ, cell_t *cell,
       }
       do { /* Remember: cpath is in forward order, that is, first hop first. */
         tor_assert(thishop);
+
+        if ((split_data = thishop->split_data)) {
+          tor_assert(thishop->subcirc);
+          if (thishop->subcirc->state == SUBCIRC_STATE_ADDED) {
+            if (!base)
+              base = split_data_get_base(split_data, 1);
+            else
+              tor_assert(base == split_data_get_base(split_data, 1));
+          } else {
+            /* used later to check if we have a valid split_data (in this
+             * case we don't) */
+            split_data = NULL;
+          }
+        }
 
         /* decrypt one layer */
         relay_crypt_one_payload(thishop->crypto.b_crypto, cell->payload);
@@ -146,19 +173,66 @@ relay_decrypt_cell(circuit_t *circ, cell_t *cell,
           }
         }
 
+        /* not recognized at this hop */
+        if (split_data) {
+          subcircuit_t* next_subcirc =
+                split_data_get_next_subcirc(split_data, CELL_DIRECTION_IN);
+
+          if (!next_subcirc) {
+            /* middle/or should not have sent us this cell, as it also had no
+             * valid split instruction. close the circuit...*/
+            log_warn(LD_CIRC, "Received incoming split cell on origin "
+                "circ %p (ID %u), although split instruction was missing. "
+                "Closing...", TO_ORIGIN_CIRCUIT(*circ), (*circ)->n_circ_id);
+            return -1;
+          }
+
+          circuit_t* split_expected_circ = next_subcirc->circ;
+
+          if (*circ != split_expected_circ) {
+            /* not expected, need to buffer */
+            log_debug(LD_CIRC, "Buffer relay backward cell received on wrong "
+                      "split circ %p (ID %u) [expected circ was %p (ID %u)]",
+                      TO_ORIGIN_CIRCUIT(*circ), (*circ)->n_circ_id,
+                      TO_ORIGIN_CIRCUIT(split_expected_circ),
+                      split_expected_circ->n_circ_id);
+            split_buffer_cell(thishop->subcirc, cell);
+            return 1;
+          } /* circ was expected */
+
+          /* Inbound cells can only leave the base circuit once by splitting.
+           * Obviously, thishop is the location were that happened. Thus, from
+           * here, we need to follow only the base circuit backwards. */
+          tor_assert(base);
+          if (*circ != base) {
+
+            if (base->marked_for_close) {
+              log_warn(LD_CIRC, "Base was marked for close, original circ was "
+                       "not. Closing base...");
+              return -1;
+            }
+
+            cpath = TO_ORIGIN_CIRCUIT(base)->cpath;
+            thishop = split_find_equal_cpath(base, thishop);
+            *circ = base;
+          }
+
+          split_data_used_subcirc(split_data, CELL_DIRECTION_IN);
+        }
+
         thishop = thishop->next;
       } while (thishop != cpath && thishop->state == CPATH_STATE_OPEN);
       log_fn(LOG_PROTOCOL_WARN, LD_OR,
              "Incoming cell at client not recognized. Closing.");
       return -1;
     } else {
-      relay_crypto_t *crypto = &TO_OR_CIRCUIT(circ)->crypto;
+      relay_crypto_t *crypto = &TO_OR_CIRCUIT(*circ)->crypto;
       /* We're in the middle. Encrypt one layer. */
       relay_crypt_one_payload(crypto->b_crypto, cell->payload);
     }
   } else /* cell_direction == CELL_DIRECTION_OUT */ {
     /* We're in the middle. Decrypt one layer. */
-    relay_crypto_t *crypto = &TO_OR_CIRCUIT(circ)->crypto;
+    relay_crypto_t *crypto = &TO_OR_CIRCUIT(*circ)->crypto;
 
     relay_crypt_one_payload(crypto->f_crypto, cell->payload);
 
@@ -198,6 +272,7 @@ relay_encrypt_cell_outbound(cell_t *cell,
 
     thishop = thishop->prev;
   } while (thishop != circ->cpath->prev);
+
 }
 
 /**
@@ -225,10 +300,22 @@ relay_crypto_clear(relay_crypto_t *crypto)
 {
   if (BUG(!crypto))
     return;
+
+  if (crypto->ref_count) {
+    *crypto->ref_count -= 1;
+
+    if (*crypto->ref_count > 0)
+      return;
+  }
+
   crypto_cipher_free(crypto->f_crypto);
   crypto_cipher_free(crypto->b_crypto);
   crypto_digest_free(crypto->f_digest);
   crypto_digest_free(crypto->b_digest);
+
+  if (crypto->ref_count) {
+    tor_free(crypto->ref_count);
+  }
 }
 
 /** Initialize <b>crypto</b> from the key material in key_data.

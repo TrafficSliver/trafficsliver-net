@@ -180,14 +180,20 @@ channel_tls_common_init(channel_tls_t *tlschan)
 /**
  * Start a new TLS channel.
  *
- * Launch a new OR connection to <b>addr</b>:<b>port</b> and expect to
- * handshake with an OR with identity digest <b>id_digest</b>, and wrap
- * it in a channel_tls_t.
+ * Launch a new OR connection to <b>addr</b>:<b>port</b> (using
+ * interface <b>if_name</b> and expect to handshake with an OR
+ * with identity digest <b>id_digest</b>, and wrap it in a
+ * channel_tls_t.
+ *
+ * Assumes that if_name is a buffer that can store up to
+ * IFNAMSIZ bytes and chooses an arbitrary interface if
+ * if_name == "".
  */
 channel_t *
-channel_tls_connect(const tor_addr_t *addr, uint16_t port,
-                    const char *id_digest,
-                    const ed25519_public_key_t *ed_id)
+channel_tls_connect_impl(const tor_addr_t *addr, uint16_t port,
+                         const char *id_digest,
+                         const ed25519_public_key_t *ed_id,
+                         const char* if_name)
 {
   channel_tls_t *tlschan = tor_malloc_zero(sizeof(*tlschan));
   channel_t *chan = &(tlschan->base_);
@@ -215,7 +221,8 @@ channel_tls_connect(const tor_addr_t *addr, uint16_t port,
   channel_mark_outgoing(chan);
 
   /* Set up or_connection stuff */
-  tlschan->conn = connection_or_connect(addr, port, id_digest, ed_id, tlschan);
+  tlschan->conn = connection_or_connect_impl(addr, port, id_digest, ed_id,
+                                             tlschan, if_name);
   /* connection_or_connect() will fill in tlschan->conn */
   if (!(tlschan->conn)) {
     chan->reason_for_closing = CHANNEL_CLOSE_FOR_ERROR;
@@ -239,6 +246,18 @@ channel_tls_connect(const tor_addr_t *addr, uint16_t port,
   if (chan) channel_register(chan);
 
   return chan;
+}
+
+/** Wrapper for channel_tls_connect that we need because of
+ * the split module: We want to be able to pass the name of the
+ * interface to use for the new connection.
+ */
+channel_t *
+channel_tls_connect(const tor_addr_t *addr, uint16_t port,
+                    const char *id_digest,
+                    const ed25519_public_key_t *ed_id)
+{
+  return channel_tls_connect_impl(addr, port, id_digest, ed_id, "");
 }
 
 /**

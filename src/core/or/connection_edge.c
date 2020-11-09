@@ -1126,6 +1126,10 @@ connection_ap_expire_beginning(void)
       continue;
     }
 
+    /* streams/connections are never associated with circuits of purpose
+     * SPLIT_JOIN */
+    tor_assert(circ->purpose != CIRCUIT_PURPOSE_SPLIT_JOIN);
+
     if (circ->purpose != CIRCUIT_PURPOSE_C_GENERAL &&
         circ->purpose != CIRCUIT_PURPOSE_C_HSDIR_GET &&
         circ->purpose != CIRCUIT_PURPOSE_S_HSDIR_POST &&

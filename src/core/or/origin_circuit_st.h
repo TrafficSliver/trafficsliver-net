@@ -10,6 +10,8 @@
 #include "core/or/or.h"
 
 #include "core/or/circuit_st.h"
+#include "feature/split/splitdefines.h"
+#include "feature/split/spliteval.h"
 
 struct onion_queue_t;
 
@@ -161,6 +163,10 @@ struct origin_circuit_t {
    * connections to this circuit. */
   unsigned int unusable_for_new_conns : 1;
 
+  /** True, if the circuit was initiated because of a users's SOCKS request.
+   * (Thereby, we may determine whether or not to split the circuit.) */
+  unsigned int initiated_by_user:1;
+
   /**
    * Tristate variable to guard against pathbias miscounting
    * due to circuit purpose transitions changing the decision
@@ -289,6 +295,16 @@ struct origin_circuit_t {
    * to 2*CircuitsAvailableTimoeut. */
   int circuit_idle_timeout;
 
+  /** information on the whole split circuit that this origin_circuit
+   * is the base of; equals NULL, if this origin_circuit is not the
+   * base of any split circuit
+   */
+  split_data_circuit_t* split_data_circuit;
+
+#ifdef SPLIT_EVAL
+  /** Structure to store evaluation data */
+  split_eval_origin_t split_eval_data;
+#endif /* SPLIT_EVAL */
 };
 
 #endif

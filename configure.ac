@@ -231,7 +231,7 @@ dnl Tor modules options. These options are namespaced with --disable-module-XXX
 dnl ---
 
 dnl All our modules.
-m4_define(MODULES, dirauth)
+m4_define(MODULES, dirauth split)
 
 dnl Directory Authority module.
 AC_ARG_ENABLE([module-dirauth],
@@ -241,6 +241,15 @@ AC_ARG_ENABLE([module-dirauth],
               AC_DEFINE([HAVE_MODULE_DIRAUTH], [1],
                         [Compile with Directory Authority feature support]))
 AM_CONDITIONAL(BUILD_MODULE_DIRAUTH, [test "x$enable_module_dirauth" != "xno"])
+
+dnl Traffic splitting module.
+AC_ARG_ENABLE([module-split],
+              AS_HELP_STRING([--disable-module-split],
+                             [Do not build tor with the split module]),
+              [], dnl Action if-given
+              AC_DEFINE([HAVE_MODULE_SPLIT], [1],
+                        [Compile with traffic splitting feature support]))
+AM_CONDITIONAL(BUILD_MODULE_SPLIT, [test "x$enable_module_split" != "xno"])
 
 dnl Helper variables.
 TOR_MODULES_ALL_ENABLED=

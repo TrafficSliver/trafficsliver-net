@@ -8,6 +8,7 @@
 #define CIRCUIT_ST_H
 
 #include "core/or/or.h"
+#include "feature/split/spliteval.h"
 
 #include "core/or/cell_queue_st.h"
 
@@ -177,6 +178,12 @@ struct circuit_t {
   /** Hashtable node: used to look up the circuit by its HS token using the HS
       circuitmap. */
   HT_ENTRY(circuit_t) hs_circuitmap_node;
+
+#ifdef SPLIT_EVAL
+  /** Cache for time values which is used for the split performance
+   * evaluation. */
+  struct timespec temp;
+#endif /* SPLIT_EVAL */
 };
 
 #endif

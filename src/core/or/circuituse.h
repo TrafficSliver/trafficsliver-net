@@ -47,6 +47,10 @@ void circuit_build_failed(origin_circuit_t *circ);
 /** Flag to set when we are trying to launch a v3 rendezvous circuit. We need
  *  to apply some additional filters on the node picked. */
 #define CIRCLAUNCH_IS_V3_RP (1<<4)
+/** Flag to set when we do not want to cannibalise an other circuit */
+#define CIRCLAUNCH_DONT_CANNIBALIZE (1<<5)
+/** Flag to set when the circuit was initiated by a user's SOCKS request */
+#define CIRCLAUNCH_INITIATED_BY_USER (1<<6)
 origin_circuit_t *circuit_launch_by_extend_info(uint8_t purpose,
                                                 extend_info_t *info,
                                                 int flags);

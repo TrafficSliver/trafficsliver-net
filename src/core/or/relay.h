@@ -17,6 +17,9 @@ extern uint64_t stats_n_relay_cells_delivered;
 extern uint64_t stats_n_circ_max_cell_reached;
 
 void relay_consensus_has_changed(const networkstatus_t *ns);
+int circuit_receive_relay_cell_impl(cell_t *cell, circuit_t *circ,
+                                    cell_direction_t cell_direction,
+                                    crypt_path_t* start_at);
 int circuit_receive_relay_cell(cell_t *cell, circuit_t *circ,
                                cell_direction_t cell_direction);
 size_t cell_queues_get_total_allocation(void);
@@ -93,6 +96,8 @@ void stream_choice_seed_weak_rng(void);
 
 circid_t packed_cell_get_circid(const packed_cell_t *cell, int wide_circ_ids);
 
+int cell_queues_check_size(void);
+
 #ifdef RELAY_PRIVATE
 STATIC int connected_cell_parse(const relay_header_t *rh, const cell_t *cell,
                          tor_addr_t *addr_out, int *ttl_out);
@@ -113,7 +118,6 @@ STATIC int connection_edge_process_resolved_cell(edge_connection_t *conn,
 STATIC packed_cell_t *packed_cell_new(void);
 STATIC packed_cell_t *cell_queue_pop(cell_queue_t *queue);
 STATIC destroy_cell_t *destroy_cell_queue_pop(destroy_cell_queue_t *queue);
-STATIC int cell_queues_check_size(void);
 STATIC int connection_edge_process_relay_cell(cell_t *cell, circuit_t *circ,
                                    edge_connection_t *conn,
                                    crypt_path_t *layer_hint);

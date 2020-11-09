@@ -140,6 +140,7 @@ src_test_test_SOURCES += \
 	src/test/test_handles.c \
 	src/test/test_hs_cache.c \
 	src/test/test_hs_descriptor.c \
+	src/test/test_instruction.c \
 	src/test/test_introduce.c \
 	src/test/test_keypin.c \
 	src/test/test_link_handshake.c \
@@ -172,6 +173,7 @@ src_test_test_SOURCES += \
 	src/test/test_socks.c \
 	src/test/test_status.c \
 	src/test/test_storagedir.c \
+	src/test/test_subcirc_list.c \
 	src/test/test_threads.c \
 	src/test/test_tortls.c \
 	src/test/test_util.c \

@@ -64,6 +64,7 @@
 #include "feature/nodelist/torcert.h"
 #include "core/or/channelpadding.h"
 #include "feature/dirauth/authmode.h"
+#include "feature/split/spliteval.h"
 
 #include "core/or/cell_st.h"
 #include "core/or/cell_queue_st.h"
@@ -1400,9 +1401,10 @@ connection_or_notify_error(or_connection_t *conn,
   /* No need to mark for error because connection.c is about to do that */
 }
 
-/** Launch a new OR connection to <b>addr</b>:<b>port</b> and expect to
- * handshake with an OR with identity digest <b>id_digest</b>.  Optionally,
- * pass in a pointer to a channel using this connection.
+/** Launch a new OR connection to <b>addr</b>:<b>port</b> (using interface
+ * <b>if_name</b>) and expect to handshake with an OR with identity digest
+ * <b>id_digest</b>. Optionally, pass in a pointer to a channel using this
+ * connection.
  *
  * If <b>id_digest</b> is me, do nothing. If we're already connected to it,
  * return that connection. If the connect() is in progress, set the
@@ -1413,14 +1415,18 @@ connection_or_notify_error(or_connection_t *conn,
  * ORs connecting to ORs, and circuit_establish_circuit(), for
  * OPs connecting to ORs.
  *
+ * Assumes that if_name is a buffer that can store up to
+ * IFNAMSIZ bytes and chooses an arbitrary interface if
+ * if_name == "".
+ *
  * Return the launched conn, or NULL if it failed.
  */
 
-MOCK_IMPL(or_connection_t *,
-connection_or_connect, (const tor_addr_t *_addr, uint16_t port,
-                        const char *id_digest,
-                        const ed25519_public_key_t *ed_id,
-                        channel_tls_t *chan))
+or_connection_t *
+connection_or_connect_impl(const tor_addr_t *_addr, uint16_t port,
+                           const char *id_digest,
+                           const ed25519_public_key_t *ed_id,
+                           channel_tls_t *chan, const char* if_name)
 {
   or_connection_t *conn;
   const or_options_t *options = get_options();
@@ -1434,6 +1440,7 @@ connection_or_connect, (const tor_addr_t *_addr, uint16_t port,
 
   tor_assert(_addr);
   tor_assert(id_digest);
+  tor_assert(if_name);
   tor_addr_copy(&addr, _addr);
 
   if (server_mode(options) && router_digest_is_me(id_digest)) {
@@ -1518,6 +1525,8 @@ connection_or_connect, (const tor_addr_t *_addr, uint16_t port,
     return NULL;
   }
 
+  strlcpy(TO_CONN(conn)->if_name, if_name, IFNAMSIZ);
+
   switch (connection_connect(TO_CONN(conn), conn->base_.address,
                              &addr, port, &socket_error)) {
     case -1:
@@ -1542,6 +1551,19 @@ connection_or_connect, (const tor_addr_t *_addr, uint16_t port,
     return NULL;
   }
   return conn;
+}
+
+/** Wrapper for connection_or_connect that we need because of
+ * the split module: We want to be able to pass the name of the
+ * interface to use for the new connection.
+ */
+MOCK_IMPL(or_connection_t *,
+connection_or_connect, (const tor_addr_t *_addr, uint16_t port,
+                        const char *id_digest,
+                        const ed25519_public_key_t *ed_id,
+                        channel_tls_t *chan))
+{
+  return connection_or_connect_impl(_addr, port, id_digest, ed_id, chan, "");
 }
 
 /** Mark orconn for close and transition the associated channel, if any, to
@@ -2353,6 +2375,11 @@ connection_or_process_cells_from_inbuf(or_connection_t *conn)
       size_t cell_network_size = get_cell_network_size(conn->wide_circ_ids);
       char buf[CELL_MAX_NETWORK_SIZE];
       cell_t cell;
+
+#ifdef SPLIT_EVAL
+      clock_gettime(CLOCK_MONOTONIC, &cell.received);
+#endif /* SPLIT_EVAL */
+
       if (connection_get_inbuf_len(TO_CONN(conn))
           < cell_network_size) /* whole response available? */
         return 0; /* not yet */

@@ -885,6 +885,7 @@ struct testgroup_t testgroups[] = {
   { "hs_service/", hs_service_tests },
   { "hs_client/", hs_client_tests },
   { "hs_intropoint/", hs_intropoint_tests },
+  { "instruction/", instruction_tests },
   { "introduce/", introduce_tests },
   { "keypin/", keypin_tests },
   { "link-handshake/", link_handshake_tests },
@@ -914,6 +915,7 @@ struct testgroup_t testgroups[] = {
   { "shared-random/", sr_tests },
   { "status/" , status_tests },
   { "storagedir/", storagedir_tests },
+  { "subcirc_list/", subcirc_list_tests},
   { "tortls/", tortls_tests },
 #ifndef ENABLE_NSS
   { "tortls/openssl/", tortls_openssl_tests },

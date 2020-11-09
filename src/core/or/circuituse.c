@@ -61,6 +61,9 @@
 #include "lib/math/fp.h"
 #include "lib/time/tvdiff.h"
 
+#include "feature/split/splitclient.h"
+#include "feature/split/spliteval.h"
+
 #include "core/or/cpath_build_state_st.h"
 #include "feature/dircommon/dir_connection_st.h"
 #include "core/or/entry_connection_st.h"
@@ -139,6 +142,18 @@ circuit_is_acceptable(const origin_circuit_t *origin_circ,
   } else {
     if (purpose != circ->purpose)
       return 0;
+  }
+
+#ifdef SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT
+  if (purpose == CIRCUIT_PURPOSE_C_GENERAL &&
+      ENTRY_TO_CONN(conn)->initiated_by_user &&
+      (!origin_circ->initiated_by_user || circ->timestamp_dirty)) {
+    return 0;
+  }
+#endif /* SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT */
+
+  if (!split_may_attach_stream(origin_circ, must_be_open)) {
+    return 0;
   }
 
   /* If this is a timed-out hidden service circuit, skip it. */
@@ -256,6 +271,9 @@ circuit_is_better(const origin_circuit_t *oa, const origin_circuit_t *ob,
   if (!oa->relaxed_timeout && ob->relaxed_timeout)
     return 1; /* oa is better. It's not relaxed. */
 
+  /* connection should never have purpose SPLIT_JOIN */
+  tor_assert(purpose != CIRCUIT_PURPOSE_SPLIT_JOIN);
+
   switch (purpose) {
     case CIRCUIT_PURPOSE_S_HSDIR_POST:
     case CIRCUIT_PURPOSE_C_HSDIR_GET:
@@ -371,6 +389,8 @@ circuit_get_best(const entry_connection_t *conn,
                                need_uptime,need_internal, (time_t)now.tv_sec))
       continue;
 
+    SPLIT_MEASURE(origin_circ, circ_allow_streams);
+
     /* now this is an acceptable circ to hand back. but that doesn't
      * mean it's the *best* circ to hand back. try to decide.
      */
@@ -456,7 +476,8 @@ circuit_expire_building(void)
    * custom timeouts yet */
   struct timeval general_cutoff, begindir_cutoff, fourhop_cutoff,
     close_cutoff, extremely_old_cutoff, hs_extremely_old_cutoff,
-    cannibalized_cutoff, c_intro_cutoff, s_intro_cutoff, stream_cutoff;
+    cannibalized_cutoff, c_intro_cutoff, s_intro_cutoff, stream_cutoff,
+    split_join_cutoff;
   const or_options_t *options = get_options();
   struct timeval now;
   cpath_build_state_t *build_state;
@@ -508,6 +529,9 @@ circuit_expire_building(void)
    * Server intro:
    *   RTTs = 4a + 3b + 2c
    *   RTTs = 9h
+   * Two hops (SPLIT_JOIN circuit)
+   *   RTTs = 2a + b
+   *   RTTs = 3h
    */
   SET_CUTOFF(general_cutoff, get_circuit_build_timeout_ms());
   SET_CUTOFF(begindir_cutoff, get_circuit_build_timeout_ms());
@@ -543,6 +567,8 @@ circuit_expire_building(void)
              MAX(get_circuit_build_close_time_ms()*2 + 1000,
                  options->SocksTimeout * 1000));
 
+  SET_CUTOFF(split_join_cutoff, get_circuit_build_timeout_ms() * (3/6.0));
+
   SMARTLIST_FOREACH_BEGIN(circuit_get_global_list(), circuit_t *,victim) {
     struct timeval cutoff;
     bool fixed_time = circuit_build_times_disabled(get_options());
@@ -576,6 +602,8 @@ circuit_expire_building(void)
       cutoff = stream_cutoff;
     else if (victim->purpose == CIRCUIT_PURPOSE_PATH_BIAS_TESTING)
       cutoff = close_cutoff;
+    else if (victim->purpose == CIRCUIT_PURPOSE_SPLIT_JOIN)
+      cutoff = split_join_cutoff;
     else if (TO_ORIGIN_CIRCUIT(victim)->has_opened &&
              victim->state != CIRCUIT_STATE_OPEN)
       cutoff = cannibalized_cutoff;
@@ -1344,8 +1372,13 @@ circuit_build_needed_circs(time_t now)
 
   circuit_expire_old_circs_as_needed(now);
 
+#ifndef SPLIT_DISABLE_PREEMPTIVE_CIRCUITS
   if (!options->DisablePredictedCircuits)
     circuit_predict_and_launch_new();
+#else /* SPLIT_DISABLE_PREEMPTIVE_CIRCUITS is defined */
+  (void)options;
+  (void)&circuit_predict_and_launch_new;
+#endif /* SPLIT_DISABLE_PREEMPTIVE_CIRCUITS */
 }
 
 /**
@@ -1519,9 +1552,14 @@ circuit_expire_old_circuits_clientside(void)
            * they are reused by clients for longer than normal. The client
            * controls their lifespan. (They never become dirty, because
            * connection_exit_begin_conn() never marks anything as dirty.)
-           * Similarly, server-side intro circuits last a long time. */
+           * Similarly, server-side intro circuits last a long time.
+           *
+           * Furthermore, SPLIT_JOIN are handled by the split module
+           * and won't get dirty, as no connection is directly attached
+           * to them */
           if (circ->purpose != CIRCUIT_PURPOSE_S_REND_JOINED &&
-              circ->purpose != CIRCUIT_PURPOSE_S_INTRO) {
+              circ->purpose != CIRCUIT_PURPOSE_S_INTRO &&
+              circ->purpose != CIRCUIT_PURPOSE_SPLIT_JOIN) {
             log_notice(LD_CIRC,
                        "Ancient non-dirty circuit %d is still around after "
                        "%ld milliseconds. Purpose: %d (%s)",
@@ -1715,6 +1753,9 @@ circuit_has_opened(origin_circuit_t *circ)
     case CIRCUIT_PURPOSE_TESTING:
       circuit_testing_opened(circ);
       break;
+    case CIRCUIT_PURPOSE_SPLIT_JOIN:
+      split_join_has_opened(circ);
+      break;
     /* default:
      * This won't happen in normal operation, but might happen if the
      * controller did it. Just let it slide. */
@@ -1797,6 +1838,9 @@ circuit_build_failed(origin_circuit_t *circ)
     /* If the path failed on an RP, retry it. */
     if (TO_CIRCUIT(circ)->purpose == CIRCUIT_PURPOSE_S_CONNECT_REND)
       hs_circ_retry_service_rendezvous_point(circ);
+    else if (TO_CIRCUIT(circ)->purpose == CIRCUIT_PURPOSE_SPLIT_JOIN) {
+      //TODO-split
+    }
 
     /* In all other cases, just bail. The rest is just failure accounting
      * that we don't want to do */
@@ -1907,6 +1951,10 @@ circuit_build_failed(origin_circuit_t *circ)
                escaped(build_state_get_exit_nickname(circ->build_state)),
                failed_at_last_hop?"last":"non-last");
       hs_circ_retry_service_rendezvous_point(circ);
+      break;
+    case CIRCUIT_PURPOSE_SPLIT_JOIN:
+      circuit_increment_failure_count();
+      //TODO-split
       break;
     /* default:
      * This won't happen in normal operation, but might happen if the
@@ -2033,6 +2081,12 @@ circuit_should_cannibalize_to_build(uint8_t purpose_to_build,
     return 0;
   }
 
+  /* Don't cannibalize for split join circuits. We want to use a new,
+   * <em>short</em> circuit. */
+  if (purpose_to_build == CIRCUIT_PURPOSE_SPLIT_JOIN) {
+    return 0;
+  }
+
   /* For vanguards, the server-side intro circ is not cannibalized
    * because we pre-build 4 hop HS circuits, and it only needs a 3 hop
    * circuit. It is also long-lived, so it is more important that
@@ -2078,7 +2132,8 @@ circuit_launch_by_extend_info(uint8_t purpose,
 
   /* If we can/should cannibalize another circuit to build this one,
    * then do so. */
-  if (circuit_should_cannibalize_to_build(purpose,
+  if (!(flags & CIRCLAUNCH_DONT_CANNIBALIZE) &&
+      circuit_should_cannibalize_to_build(purpose,
                                           extend_info != NULL,
                                           onehop_tunnel)) {
     /* see if there are appropriate circs available to cannibalize. */
@@ -2209,6 +2264,8 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
 
   tor_assert(conn);
   tor_assert(circp);
+
+  tor_assert(desired_circuit_purpose != CIRCUIT_PURPOSE_SPLIT_JOIN);
   if (ENTRY_TO_CONN(conn)->state != AP_CONN_STATE_CIRCUIT_WAIT) {
     connection_t *c = ENTRY_TO_CONN(conn);
     log_err(LD_BUG, "Connection state mismatch: wanted "
@@ -2492,8 +2549,27 @@ circuit_get_open_circ_or_launch(entry_connection_t *conn,
         log_info(LD_GENERAL, "Getting rendezvous circuit to v3 service!");
       }
 
-      circ = circuit_launch_by_extend_info(new_circ_purpose, extend_info,
-                                           flags);
+      if (new_circ_purpose == CIRCUIT_PURPOSE_C_GENERAL &&
+          ENTRY_TO_CONN(conn)->initiated_by_user) {
+
+        tor_assert(ENTRY_TO_CONN(conn)->type == CONN_TYPE_AP);
+        flags |= CIRCLAUNCH_INITIATED_BY_USER;
+
+#ifdef SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT
+      /* we want to build NEW circuits for each SOCKS connection, so don't
+       * cannibalise 
+       wdlc: this is not the best option, because the browser can open several socks connection per webpage load
+       Thus, more entries/circuits than setup will be used
+       I solved this by using attach circuits from stem
+      */ 
+        flags |= CIRCLAUNCH_DONT_CANNIBALIZE;
+#endif /* SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT */
+
+      }
+
+      log_info(LD_GENERAL, "wdlc: extending by info: purpose %u, flags %d, extend info %s", new_circ_purpose, flags,extend_info_describe(extend_info));
+
+      circ = circuit_launch_by_extend_info(new_circ_purpose, extend_info, flags);
     }
 
     extend_info_free(extend_info);
@@ -2592,6 +2668,8 @@ link_apconn_to_circ(entry_connection_t *apconn, origin_circuit_t *circ,
                     crypt_path_t *cpath)
 {
   const node_t *exitnode = NULL;
+
+  tor_assert(circ->base_.purpose != CIRCUIT_PURPOSE_SPLIT_JOIN);
 
   /* add it into the linked list of streams on this circuit */
   log_debug(LD_APP|LD_CIRC, "attaching new conn to circ. n_circ_id %u.",
@@ -2722,6 +2800,10 @@ connection_ap_handshake_attach_chosen_circuit(entry_connection_t *conn,
   tor_assert(circ);
   tor_assert(circ->base_.state == CIRCUIT_STATE_OPEN);
 
+  /* streams may never be attached to the newly launched split sub-circuit;
+   * should have been checked in advance */
+  tor_assert(circ->base_.purpose != CIRCUIT_PURPOSE_SPLIT_JOIN);
+
   base_conn->state = AP_CONN_STATE_CIRCUIT_WAIT;
 
   if (!circ->base_.timestamp_dirty ||
@@ -2738,6 +2820,18 @@ connection_ap_handshake_attach_chosen_circuit(entry_connection_t *conn,
 
   /* Now, actually link the connection. */
   link_apconn_to_circ(conn, circ, cpath);
+
+  /* Tell the middle node to consider this circuit for evaluation
+   * measurements, if conn has been initiated by the user.*/
+  if (ENTRY_TO_CONN(conn)->initiated_by_user) {
+
+#ifdef SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT
+    tor_assert(circ->initiated_by_user);
+#endif /* SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT */
+
+    if(split_eval_consider(TO_CIRCUIT(circ), ++split_eval_runs) < 0)
+      return -1;
+  }
 
   tor_assert(conn->socks_request);
   if (conn->socks_request->command == SOCKS_COMMAND_CONNECT) {
@@ -3066,6 +3160,12 @@ circuit_change_purpose(circuit_t *circ, uint8_t new_purpose)
               circ->purpose,
               circuit_purpose_to_string(new_purpose),
               new_purpose);
+
+    /* If we're repurposing a circuit, it should no longer be considered for
+     * split circuits, which is why we need to reset the initiated_by_user flags */
+    TO_ORIGIN_CIRCUIT(circ)->initiated_by_user = 0;
+    if (TO_ORIGIN_CIRCUIT(circ)->build_state)
+      TO_ORIGIN_CIRCUIT(circ)->build_state->initiated_by_user = 0;
 
     /* Take specific actions if we are repurposing a hidden service circuit. */
     if (circuit_purpose_is_hidden_service(circ->purpose) &&

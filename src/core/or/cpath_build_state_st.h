@@ -23,6 +23,9 @@ struct cpath_build_state_t {
    * These are for encrypted dir conns that exit to this router, not
    * for arbitrary exits from the circuit. */
   unsigned int onehop_tunnel : 1;
+  /** True, if the circuit was initiated because of a users's SOCKS request.
+   * (Thereby, we may determine whether or not to split the circuit.) */
+  unsigned int initiated_by_user:1;
   /** The crypt_path_t to append after rendezvous: used for rendezvous. */
   crypt_path_t *pending_final_cpath;
   /** A ref-counted reference to the crypt_path_t to append after
@@ -32,6 +35,10 @@ struct cpath_build_state_t {
   int failure_count;
   /** At what time should we give up on this task? */
   time_t expiry_time;
+  /** List of node_t which need to be excluded while building, because they
+   * are already used by the current split_circuit
+   */
+  smartlist_t* split_excluded_nodes;
 };
 
 #endif

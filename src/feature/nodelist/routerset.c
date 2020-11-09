@@ -404,6 +404,21 @@ routerset_subtract_nodes(smartlist_t *lst, const routerset_t *routerset)
     });
 }
 
+/** Remove every node_t from <b>lst</b> that is not in <b>routerset</b>. */
+void
+routerset_intersect_nodes(smartlist_t *lst, const routerset_t *routerset)
+{
+  tor_assert(lst);
+  if (!routerset)
+    return;
+  SMARTLIST_FOREACH(lst, const node_t *, node, {
+      if (!routerset_contains_node(routerset, node)) {
+        //log_debug(LD_DIR, "Subtracting %s",r->nickname);
+        SMARTLIST_DEL_CURRENT(lst, node);
+      }
+    });
+}
+
 /** Return a new string that when parsed by routerset_parse_string() will
  * yield <b>set</b>. */
 char *

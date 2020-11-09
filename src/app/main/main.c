@@ -61,6 +61,7 @@
 #include "feature/rend/rendcache.h"
 #include "feature/rend/rendclient.h"
 #include "feature/rend/rendservice.h"
+#include "feature/split/spliteval.h"
 #include "feature/stats/geoip_stats.h"
 #include "feature/stats/predict_ports.h"
 #include "feature/stats/rephist.h"
@@ -627,6 +628,11 @@ tor_init(int argc, char *argv[])
 
     tor_compress_log_init_warnings();
   }
+
+#ifdef SPLIT_EVAL
+    split_eval_log_sync();
+    split_eval_log_gettime_info();
+#endif /* SPLIT_EVAL */
 
 #ifdef HAVE_RUST
   rust_log_welcome_string();

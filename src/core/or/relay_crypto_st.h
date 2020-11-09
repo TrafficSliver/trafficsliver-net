@@ -25,6 +25,8 @@ struct relay_crypto_t {
   /** Digest state for cells heading away from the OR at this step. */
   struct crypto_digest_t *b_digest;
 
+  /** Reference counter used by the split module */
+  int* ref_count;
 };
 #undef crypto_cipher_t
 

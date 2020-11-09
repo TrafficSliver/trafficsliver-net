@@ -2292,7 +2292,7 @@ channel_free_all(void)
 }
 
 /**
- * Connect to a given addr/port/digest.
+ * Connect to a given addr/port/digest using interface <b>if_name</b>.
  *
  * This sets up a new outgoing channel; in the future if multiple
  * channel_t subclasses are available, this is where the selection policy
@@ -2300,13 +2300,30 @@ channel_free_all(void)
  * or make a new type including a tor_addr_t and port, so we have a
  * single abstract object encapsulating all the protocol details of
  * how to contact an OR.
+ *
+ * Assumes that if_name is a buffer that can store up to
+ * IFNAMSIZ bytes and chooses an arbitrary interface if
+ * if_name == "".
+ */
+channel_t *
+channel_connect_impl(const tor_addr_t *addr, uint16_t port,
+                     const char *id_digest,
+                     const ed25519_public_key_t *ed_id,
+                     const char* if_name)
+{
+  return channel_tls_connect_impl(addr, port, id_digest, ed_id, if_name);
+}
+
+/** Wrapper for channel_connect that we need because of
+ * the split module: We want to be able to pass the name of the
+ * interface to use for the new connection.
  */
 channel_t *
 channel_connect(const tor_addr_t *addr, uint16_t port,
                 const char *id_digest,
                 const ed25519_public_key_t *ed_id)
 {
-  return channel_tls_connect(addr, port, id_digest, ed_id);
+  return channel_connect_impl(addr, port, id_digest, ed_id, "");
 }
 
 /**

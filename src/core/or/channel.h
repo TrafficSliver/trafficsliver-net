@@ -659,6 +659,11 @@ int channel_send_destroy(circid_t circ_id, channel_t *chan,
  * something transport/address format independent.
  */
 
+channel_t * channel_connect_impl(const tor_addr_t *addr, uint16_t port,
+                                 const char *rsa_id_digest,
+                                 const struct ed25519_public_key_t *ed_id,
+                                 const char* if_name);
+
 channel_t * channel_connect(const tor_addr_t *addr, uint16_t port,
                             const char *rsa_id_digest,
                             const struct ed25519_public_key_t *ed_id);

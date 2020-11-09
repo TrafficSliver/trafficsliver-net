@@ -57,6 +57,8 @@
 #include "feature/relay/routermode.h"
 #include "feature/stats/rephist.h"
 #include "lib/crypt_ops/crypto_util.h"
+#include "feature/split/spliteval.h"
+#include "feature/split/splitor.h"
 
 #include "core/or/cell_st.h"
 #include "core/or/or_circuit_st.h"
@@ -336,6 +338,9 @@ command_process_create_cell(cell_t *cell, channel_t *chan)
   }
 
   circ = or_circuit_new(cell->circ_id, chan);
+  SPLIT_MEASURE(circ, circ_allocated);
+  SPLIT_COPY(circ, circ_create_frombuf, &cell->received);
+
   circ->base_.purpose = CIRCUIT_PURPOSE_OR;
   circuit_set_state(TO_CIRCUIT(circ), CIRCUIT_STATE_ONIONSKIN_PENDING);
   create_cell = tor_malloc_zero(sizeof(create_cell_t));
@@ -437,6 +442,9 @@ command_process_created_cell(cell_t *cell, channel_t *chan)
   if (CIRCUIT_IS_ORIGIN(circ)) { /* we're the OP. Handshake this. */
     origin_circuit_t *origin_circ = TO_ORIGIN_CIRCUIT(circ);
     int err_reason = 0;
+
+    SPLIT_COPY(origin_circ, circ_created_frombuf, &cell->received);
+
     log_debug(LD_OR,"at OP. Finishing handshake.");
     if ((err_reason = circuit_finish_handshake(origin_circ,
                                         &extended_cell.created_cell)) < 0) {
@@ -568,6 +576,7 @@ command_process_relay_cell(cell_t *cell, channel_t *chan)
         return;
       }
       --or_circ->remaining_relay_early_cells;
+      split_decrease_remaining_relay_early(or_circ);
     }
   }
 

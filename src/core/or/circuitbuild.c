@@ -69,6 +69,11 @@
 #include "feature/stats/predict_ports.h"
 #include "lib/crypt_ops/crypto_rand.h"
 
+#include "feature/split/splitdefines.h"
+#include "feature/split/splitclient.h"
+#include "feature/split/splitcommon.h"
+#include "feature/split/spliteval.h"
+
 #include "core/or/cell_st.h"
 #include "core/or/cpath_build_state_st.h"
 #include "core/or/entry_connection_st.h"
@@ -79,6 +84,8 @@
 #include "feature/nodelist/microdesc_st.h"
 #include "feature/nodelist/routerinfo_st.h"
 #include "feature/nodelist/routerstatus_st.h"
+
+#include <net/if.h>
 
 static channel_t * channel_connect_for_circuit(const tor_addr_t *addr,
                                             uint16_t port,
@@ -98,21 +105,38 @@ static const node_t *choose_good_middle_server(uint8_t purpose,
                           crypt_path_t *head,
                           int cur_len);
 
-/** This function tries to get a channel to the specified endpoint,
- * and then calls command_setup_channel() to give it the right
- * callbacks.
+/** This function tries to get a channel to the specified endpoint
+ * (using interface <b>if_name</b>), and then calls
+ * command_setup_channel() to give it the right callbacks.
+ * Assumes that if_name is a buffer that can store up to
+ * IFNAMSIZ bytes and chooses an arbitrary interface if
+ * if_name == "".
+ */
+static channel_t *
+channel_connect_for_circuit_impl(const tor_addr_t *addr, uint16_t port,
+                                 const char *id_digest,
+                                 const ed25519_public_key_t *ed_id,
+                                 const char* if_name)
+{
+  channel_t *chan;
+
+  chan = channel_connect_impl(addr, port, id_digest, ed_id, if_name);
+  if (chan) command_setup_channel(chan);
+
+  return chan;
+}
+
+/** Wrapper for channel_connect_for_circuit that we need because of
+ * the split module: We want to be able to pass the name of the
+ * interface to use for the new connection.
  */
 static channel_t *
 channel_connect_for_circuit(const tor_addr_t *addr, uint16_t port,
                             const char *id_digest,
                             const ed25519_public_key_t *ed_id)
 {
-  channel_t *chan;
-
-  chan = channel_connect(addr, port, id_digest, ed_id);
-  if (chan) command_setup_channel(chan);
-
-  return chan;
+   return channel_connect_for_circuit_impl(addr, port, id_digest,
+                                           ed_id, "");
 }
 
 /** Search for a value for circ_id that we can use on <b>chan</b> for an
@@ -462,6 +486,10 @@ origin_circuit_init(uint8_t purpose, int flags)
     ((flags & CIRCLAUNCH_NEED_CAPACITY) ? 1 : 0);
   circ->build_state->is_internal =
     ((flags & CIRCLAUNCH_IS_INTERNAL) ? 1 : 0);
+  circ->build_state->initiated_by_user =
+    ((flags & CIRCLAUNCH_INITIATED_BY_USER) ? 1 : 0);
+  circ->initiated_by_user =
+    ((flags & CIRCLAUNCH_INITIATED_BY_USER) ? 1 : 0);
   circ->base_.purpose = purpose;
   return circ;
 }
@@ -486,17 +514,37 @@ circuit_establish_circuit(uint8_t purpose, extend_info_t *exit_ei, int flags)
 
   circ = origin_circuit_init(purpose, flags);
 
+  SPLIT_MEASURE(circ, circ_allocated);
+
+  /* create list excluded nodes due to a split circuit */
+  if (exit_ei) {
+    circ->build_state->split_excluded_nodes =
+        split_data_get_excluded_nodes(exit_ei->split_data);
+    /* avoid dangling pointers as much as possible */
+    exit_ei->split_data = NULL;
+  }
+
+  SPLIT_MEASURE(circ, circ_cpath_start);
+
   if (onion_pick_cpath_exit(circ, exit_ei, is_hs_v3_rp_circuit) < 0 ||
       onion_populate_cpath(circ) < 0) {
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_NOPATH);
     return NULL;
   }
 
+  SPLIT_MEASURE(circ, circ_cpath_done);
+
   control_event_circuit_status(circ, CIRC_EVENT_LAUNCHED, 0);
 
-  if ((err_reason = circuit_handle_first_hop(circ)) < 0) {
-    circuit_mark_for_close(TO_CIRCUIT(circ), -err_reason);
-    return NULL;
+  if (purpose != CIRCUIT_PURPOSE_SPLIT_JOIN) {
+    /* for SPLIT_JOIN circuits, we first need to add the according
+     * split_data and sub-circuit structures before calling
+     * circuit_handle_first_hop() (for being able to choose the
+     * interface to use for this new circuit */
+    if ((err_reason = circuit_handle_first_hop(circ)) < 0) {
+      circuit_mark_for_close(TO_CIRCUIT(circ), -err_reason);
+      return NULL;
+    }
   }
   return circ;
 }
@@ -521,6 +569,7 @@ circuit_handle_first_hop(origin_circuit_t *circ)
   const char *msg = NULL;
   int should_launch = 0;
   const or_options_t *options = get_options();
+  char if_name[IFNAMSIZ] = "";
 
   firsthop = onion_next_hop_in_cpath(circ->cpath);
   tor_assert(firsthop);
@@ -545,11 +594,32 @@ circuit_handle_first_hop(origin_circuit_t *circ)
             fmt_addrport(&firsthop->extend_info->addr,
                          firsthop->extend_info->port));
 
-  n_chan = channel_get_for_extend(firsthop->extend_info->identity_digest,
-                                  &firsthop->extend_info->ed_identity,
-                                  &firsthop->extend_info->addr,
-                                  &msg,
-                                  &should_launch);
+  /* get the interface we have specified to use for this circuit
+   * (if there is one) */
+  if (TO_CIRCUIT(circ)->purpose == CIRCUIT_PURPOSE_SPLIT_JOIN) {
+    circuit_t* base;
+
+    /* we have not yet appended the cpath of the new JOIN circuit */
+    tor_assert(circ->cpath->prev->split_data);
+    base = split_data_get_base(circ->cpath->prev->split_data, 0);
+
+    split_next_if_name(TO_ORIGIN_CIRCUIT(base), if_name, IFNAMSIZ);
+  }
+
+  if (strcmp(if_name, "") == 0) {
+    /* only search for existing channels, if we have not specified an
+     * interface to use for this circuit */
+    n_chan = channel_get_for_extend(firsthop->extend_info->identity_digest,
+                                    &firsthop->extend_info->ed_identity,
+                                    &firsthop->extend_info->addr,
+                                    &msg,
+                                    &should_launch);
+  } else {
+    /* always launch a new channel, if we have specified an interface
+     * to use for this circuit */
+    n_chan = NULL;
+    should_launch = 1;
+  }
 
   if (!n_chan) {
     /* not currently connected in a useful way. */
@@ -561,11 +631,13 @@ circuit_handle_first_hop(origin_circuit_t *circ)
     if (should_launch) {
       if (circ->build_state->onehop_tunnel)
         control_event_bootstrap(BOOTSTRAP_STATUS_CONN_DIR, 0);
-      n_chan = channel_connect_for_circuit(
+      SPLIT_MEASURE(circ, circ_channel_start);
+      n_chan = channel_connect_for_circuit_impl(
           &firsthop->extend_info->addr,
           firsthop->extend_info->port,
           firsthop->extend_info->identity_digest,
-          &firsthop->extend_info->ed_identity);
+          &firsthop->extend_info->ed_identity,
+          if_name);
       if (!n_chan) { /* connect failed, forget the whole thing */
         log_info(LD_CIRC,"connect to firsthop failed. Closing.");
         return -END_CIRC_REASON_CONNECTFAILED;
@@ -652,6 +724,7 @@ circuit_n_chan_done(channel_t *chan, int status, int close_origin_circuits)
       circ->n_hop = NULL;
 
       if (CIRCUIT_IS_ORIGIN(circ)) {
+        SPLIT_MEASURE(TO_ORIGIN_CIRCUIT(circ), circ_channel_done);
         if ((err_reason =
              circuit_send_next_onion_skin(TO_ORIGIN_CIRCUIT(circ))) < 0) {
           log_info(LD_CIRC,
@@ -952,6 +1025,8 @@ circuit_send_first_onion_skin(origin_circuit_t *circ)
 
   log_debug(LD_CIRC,"First skin; sending create cell.");
 
+  SPLIT_MEASURE(circ, circ_build_start);
+
   if (circ->build_state->onehop_tunnel) {
     control_event_bootstrap(BOOTSTRAP_STATUS_ONEHOP_CREATE, 0);
   } else {
@@ -991,6 +1066,8 @@ circuit_send_first_onion_skin(origin_circuit_t *circ)
   if (circuit_deliver_create_cell(TO_CIRCUIT(circ), &cc, 0) < 0)
     return - END_CIRC_REASON_RESOURCELIMIT;
 
+  SPLIT_COPY(circ, circ_create_tobuf, &(TO_CIRCUIT(circ)->temp));
+
   circ->cpath->state = CPATH_STATE_AWAITING_KEYS;
   circuit_set_state(TO_CIRCUIT(circ), CIRCUIT_STATE_BUILDING);
   log_info(LD_CIRC,"First hop: finished sending %s cell to '%s'",
@@ -1022,6 +1099,36 @@ circuit_build_no_more_hops(origin_circuit_t *circ)
     r = entry_guard_succeeded(&circ->guard_state);
   }
   const int is_usable_for_streams = (r == GUARD_USABLE_NOW);
+
+  SPLIT_MEASURE(circ, circ_build_finished);
+
+  /* Launch new split sub-circuits now (before changing the state) to prevent
+   * streams from being attached too early */
+#ifdef SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT
+  /* if we launch new circuits for each new SOCKS connection, then
+   * we can easily control that only those newly launched circuits
+   * will be split. */
+  if (circ->initiated_by_user) {
+    tor_assert(circ->base_.purpose == CIRCUIT_PURPOSE_C_GENERAL);
+    tor_assert(!circ->build_state->onehop_tunnel);
+    tor_assert(circ->build_state->desired_path_len >=3);
+    tor_assert(!circ->build_state->is_internal);
+
+#else /* SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT not defined */
+
+  /* if we do NOT launch new circuits for each new SOCKS connection, we
+   * need to preemptively split ALL eligable circuits in order to be sure
+   * that the circuit we choose for our SOCKS connection is, indeed, split.
+   */
+  if (circ->base_.purpose == CIRCUIT_PURPOSE_C_GENERAL &&
+      !circ->build_state->onehop_tunnel &&
+      circ->build_state->desired_path_len >=3 &&
+      !circ->build_state->is_internal) {
+#endif /* SPLIT_SOCKS_LAUNCH_NEW_CIRCUIT */
+    split_launch_subcircuit(circ, circ->cpath->next,
+                            split_get_subcircs_per_circ() - 1);
+  }
+
   if (r == GUARD_USABLE_NOW) {
     circuit_set_state(TO_CIRCUIT(circ), CIRCUIT_STATE_OPEN);
   } else if (r == GUARD_MAYBE_USABLE_LATER) {
@@ -1070,6 +1177,7 @@ circuit_build_no_more_hops(origin_circuit_t *circ)
   if (circ->base_.purpose == CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT) {
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_FINISHED);
   }
+
   return 0;
 }
 
@@ -1505,6 +1613,8 @@ onionskin_answer(or_circuit_t *circ,
 
   append_cell_to_circuit_queue(TO_CIRCUIT(circ),
                                circ->p_chan, &cell, CELL_DIRECTION_IN, 0);
+
+  SPLIT_COPY(circ, circ_created_tobuf, &(TO_CIRCUIT(circ)->temp));
   log_debug(LD_CIRC,"Finished sending '%s' cell.",
             used_create_fast ? "created_fast" : "created");
 
@@ -1605,6 +1715,11 @@ route_len_for_purpose(uint8_t purpose, extend_info_t *exit_ei)
         purpose == CIRCUIT_PURPOSE_C_HSDIR_GET ||
         purpose == CIRCUIT_PURPOSE_C_INTRODUCING)
       return routelen+2;
+  }
+
+  if (purpose == CIRCUIT_PURPOSE_SPLIT_JOIN) {
+    tor_assert(exit_ei);
+    return SPLIT_DEFAULT_ROUTE_LEN;
   }
 
   if (!exit_ei)
@@ -2022,6 +2137,7 @@ pick_restricted_middle_node(router_crn_flags_t flags,
                                         (flags & CRN_NEED_UPTIME) != 0,
                                         (flags & CRN_NEED_CAPACITY) != 0,
                                         (flags & CRN_NEED_GUARD) != 0,
+                                        (flags & CRN_NEED_GUARD_STRICT) != 0,
                                         (flags & CRN_NEED_DESC) != 0,
                                         (flags & CRN_PREF_ADDR) != 0,
                                         (flags & CRN_DIRECT_CONN) != 0);
@@ -2108,10 +2224,29 @@ choose_good_exit_server(origin_circuit_t *circ,
       tor_assert_nonfatal(is_internal);
       FALLTHROUGH;
     case CIRCUIT_PURPOSE_C_GENERAL:
-      if (is_internal) /* pick it like a middle hop */
+      if (is_internal) { /* pick it like a middle hop */
         return router_choose_random_node(NULL, options->ExcludeNodes, flags);
-      else
+      } else if (options->SplitExitNodes && circ->initiated_by_user) {
+        const node_t *choice = NULL;
+        smartlist_t *exits = smartlist_new();
+        routerset_get_all_nodes(exits, options->SplitExitNodes, NULL, 0);
+
+        SMARTLIST_FOREACH_BEGIN(exits, const node_t *, exit_node) {
+          if (exit_node && !choice) {
+            choice = exit_node;
+            break;
+          }
+        } SMARTLIST_FOREACH_END(exit_node);
+
+        smartlist_free(exits);
+
+        if (!choice)
+          log_warn(LD_CIRC, "SplitExitNodes contains no known nodes.");
+
+        return choice;
+      } else {
         return choose_good_exit_server_general(flags);
+      }
     case CIRCUIT_PURPOSE_C_ESTABLISH_REND:
       {
         /* Pick a new RP */
@@ -2120,6 +2255,10 @@ choose_good_exit_server(origin_circuit_t *circ,
                  safe_str_client(node_describe(rendezvous_node)));
         return rendezvous_node;
       }
+    case CIRCUIT_PURPOSE_SPLIT_JOIN:
+      /* we must always provide a suitable exit router when creating a
+         circuit for joining a split circuit */
+      tor_assert_unreached();
   }
   log_warn(LD_BUG,"Unhandled purpose %d", TO_CIRCUIT(circ)->purpose);
   tor_fragile_assert();
@@ -2177,6 +2316,8 @@ warn_if_last_router_excluded(origin_circuit_t *circ,
       rs = options->ExcludeExitNodesUnion_;
       description = "controller-selected circuit target";
       break;
+    case CIRCUIT_PURPOSE_SPLIT_JOIN:
+      description = "chosen split merging node";
     }
 
   if (routerset_contains_extendinfo(rs, exit_ei)) {
@@ -2270,6 +2411,13 @@ circuit_append_new_exit(origin_circuit_t *circ, extend_info_t *exit_ei)
   tor_assert(exit_ei);
   tor_assert(circ);
 
+  if (split_get_base_(TO_CIRCUIT(circ))) {
+    log_warn(LD_CIRC, "Extending split circuit (%p, ID %u) not supported. "
+             "Closing...", circ, TO_CIRCUIT(circ)->n_circ_id);
+    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+    return -1;
+  }
+
   state = circ->build_state;
   tor_assert(state);
   extend_info_free(state->chosen_exit);
@@ -2292,7 +2440,10 @@ circuit_extend_to_new_exit(origin_circuit_t *circ, extend_info_t *exit_ei)
 
   tor_gettimeofday(&circ->base_.timestamp_began);
 
-  circuit_append_new_exit(circ, exit_ei);
+  if (circuit_append_new_exit(circ, exit_ei)) {
+    /* already marked for close */
+    return -1;
+  }
   circuit_set_state(TO_CIRCUIT(circ), CIRCUIT_STATE_BUILDING);
   if ((err_reason = circuit_send_next_onion_skin(circ))<0) {
     log_warn(LD_CIRC, "Couldn't extend circuit to new point %s.",
@@ -2564,7 +2715,31 @@ choose_good_middle_server(uint8_t purpose,
   log_debug(LD_CIRC, "Contemplating intermediate hop #%d: random choice.",
             cur_len+1);
 
+  // ensure that one of the SplitMiddleNodes is used for performance eval circuits
+  tor_assert(state);
+  if (options->SplitMiddleNodes && state->initiated_by_user) {
+	  smartlist_t *middles = smartlist_new();
+	  routerset_get_all_nodes(middles, options->SplitMiddleNodes, NULL, 0);
+
+	  choice = NULL;
+	  SMARTLIST_FOREACH_BEGIN(middles, const node_t *, middle_node) {
+	    if (middle_node && !choice) {
+	      choice = middle_node;
+	      break;
+	    }
+	  } SMARTLIST_FOREACH_END(middle_node);
+
+	  smartlist_free(middles);
+
+	  if (!choice)
+	    log_warn(LD_CIRC, "SplitMiddleNodes contains no known nodes.");
+
+	  return choice;
+  }
+
   excluded = build_middle_exclude_list(purpose, state, head, cur_len);
+  if (state && state->split_excluded_nodes)
+    smartlist_add_all(excluded, state->split_excluded_nodes);
 
   if (state->need_uptime)
     flags |= CRN_NEED_UPTIME;
@@ -2579,7 +2754,29 @@ choose_good_middle_server(uint8_t purpose,
     return choice;
   }
 
-  choice = router_choose_random_node(excluded, options->ExcludeNodes, flags);
+  if (options->MiddleNodes) {
+    smartlist_t *sl = smartlist_new();
+    routerset_get_all_nodes(sl, options->MiddleNodes,
+                            options->ExcludeNodes, 1);
+
+    smartlist_subtract(sl, excluded);
+
+    choice = node_sl_choose_by_bandwidth(sl, WEIGHT_FOR_MID);
+    smartlist_free(sl);
+    if (choice) {
+      log_fn(LOG_INFO, LD_CIRC, "Chose fixed middle node: %s",
+          hex_str(choice->identity, DIGEST_LEN));
+    } else {
+      log_fn(LOG_NOTICE, LD_CIRC, "Restricted middle not available");
+    }
+  } else {
+      // Asya: It may happen that our middle nodes are not in the list
+      // of potential ORs because they did not fulfill one or more criteria,
+      // e.g., capacity, uptime, etc. Therefore, the restrictedset may be 
+      // empty and a connection to our middles may not be possible. 
+      choice = router_choose_random_node_impl(excluded, options->ExcludeNodes,
+                                          options->SplitMiddleNodes, flags);
+  }
   smartlist_free(excluded);
   return choice;
 }
@@ -2609,7 +2806,33 @@ choose_good_entry_server(uint8_t purpose, cpath_build_state_t *state,
   /* Once we used this function to select a node to be a guard.  We had
    * 'state == NULL' be the signal for that.  But we don't do that any more.
    */
-  tor_assert_nonfatal(state);
+  tor_assert(state);
+
+  if (options->SplitEntryNodes &&
+      (purpose == CIRCUIT_PURPOSE_SPLIT_JOIN || state->initiated_by_user)) {
+
+    smartlist_t *entries = smartlist_new();
+    routerset_get_all_nodes(entries, options->SplitEntryNodes, NULL, 0);
+
+    choice = NULL;
+    SMARTLIST_FOREACH_BEGIN(entries, const node_t *, entry_node) {
+      if (entry_node && !choice) {
+        if (state->split_excluded_nodes &&
+            smartlist_contains(state->split_excluded_nodes, entry_node)) {
+          continue;
+        }
+        choice = entry_node;
+        break;
+      }
+    } SMARTLIST_FOREACH_END(entry_node);
+
+    smartlist_free(entries);
+
+    if (!choice)
+      log_warn(LD_CIRC, "SplitEntryNodes contains no (more) known nodes.");
+
+    return choice;
+  }
 
   if (state && options->UseEntryGuards &&
       (purpose != CIRCUIT_PURPOSE_TESTING || options->BridgeRelay)) {
@@ -2627,12 +2850,18 @@ choose_good_entry_server(uint8_t purpose, cpath_build_state_t *state,
     nodelist_add_node_and_family(excluded, node);
   }
 
+  if (state && state->split_excluded_nodes)
+    smartlist_add_all(excluded, state->split_excluded_nodes);
+
   if (state) {
     if (state->need_uptime)
       flags |= CRN_NEED_UPTIME;
     if (state->need_capacity)
       flags |= CRN_NEED_CAPACITY;
   }
+
+  if (purpose == CIRCUIT_PURPOSE_SPLIT_JOIN || state->initiated_by_user)
+    flags |= CRN_NEED_GUARD_STRICT;
 
   choice = router_choose_random_node(excluded, options->ExcludeNodes, flags);
   smartlist_free(excluded);

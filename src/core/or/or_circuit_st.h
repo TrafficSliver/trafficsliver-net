@@ -11,6 +11,8 @@
 
 #include "core/or/circuit_st.h"
 #include "core/or/crypt_path_st.h"
+#include "feature/split/split_data_st.h"
+#include "feature/split/spliteval.h"
 
 struct onion_queue_t;
 
@@ -74,6 +76,18 @@ struct or_circuit_t {
    * exit-ward queues of this circuit; reset every time when writing
    * buffer stats to disk. */
   uint64_t total_cell_waiting_time;
+
+  /** Information on split circuit that is merged at this middle node */
+  split_data_t* split_data;
+
+  /** Reference to the sub-circuit information under which this or_circuit
+   * is part of split_data structure referenced above. */
+  subcircuit_t* subcirc;
+
+#ifdef SPLIT_EVAL
+  /** Structure to store evaluation data */
+  split_eval_or_t split_eval_data;
+#endif /* SPLIT_EVAL */
 };
 
 #endif

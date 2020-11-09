@@ -95,6 +95,9 @@
 #include "lib/compress/compress_zlib.h"
 #include "lib/compress/compress_zstd.h"
 #include "lib/container/buffers.h"
+#include "feature/split/cell_buffer.h"
+#include "feature/split/splitcommon.h"
+#include "feature/split/spliteval.h"
 
 #include "ht.h"
 
@@ -106,6 +109,7 @@
 #include "core/or/extend_info_st.h"
 #include "core/or/or_circuit_st.h"
 #include "core/or/origin_circuit_st.h"
+#include "feature/split/split_data_st.h"
 
 /********* START VARIABLES **********/
 
@@ -127,7 +131,6 @@ static smartlist_t *circuits_pending_other_guards = NULL;
  * circuit_mark_for_close and which are waiting for circuit_about_to_free. */
 static smartlist_t *circuits_pending_close = NULL;
 
-static void circuit_free_cpath_node(crypt_path_t *victim);
 static void cpath_ref_decref(crypt_path_reference_t *cpath_ref);
 static void circuit_about_to_free_atexit(circuit_t *circ);
 static void circuit_about_to_free(circuit_t *circ);
@@ -768,6 +771,9 @@ circuit_purpose_to_controller_string(uint8_t purpose)
     case CIRCUIT_PURPOSE_HS_VANGUARDS:
       return "HS_VANGUARDS";
 
+    case CIRCUIT_PURPOSE_SPLIT_JOIN:
+      return "SPLIT JOIN";
+
     default:
       tor_snprintf(buf, sizeof(buf), "UNKNOWN_%d", (int)purpose);
       return buf;
@@ -796,6 +802,7 @@ circuit_purpose_to_controller_hs_state_string(uint8_t purpose)
     case CIRCUIT_PURPOSE_CONTROLLER:
     case CIRCUIT_PURPOSE_PATH_BIAS_TESTING:
     case CIRCUIT_PURPOSE_HS_VANGUARDS:
+    case CIRCUIT_PURPOSE_SPLIT_JOIN:
       return NULL;
 
     case CIRCUIT_PURPOSE_INTRO_POINT:
@@ -895,6 +902,9 @@ circuit_purpose_to_string(uint8_t purpose)
 
     case CIRCUIT_PURPOSE_HS_VANGUARDS:
       return "Hidden service: Pre-built vanguard circuit";
+
+    case CIRCUIT_PURPOSE_SPLIT_JOIN:
+      return "Split module: circuit to join existing split circuit";
 
     default:
       tor_snprintf(buf, sizeof(buf), "UNKNOWN_%d", (int)purpose);
@@ -1094,6 +1104,7 @@ circuit_free_(circuit_t *circ)
         extend_info_free(ocirc->build_state->chosen_exit);
         circuit_free_cpath_node(ocirc->build_state->pending_final_cpath);
         cpath_ref_decref(ocirc->build_state->service_pending_final_cpath_ref);
+        smartlist_free(ocirc->build_state->split_excluded_nodes);
     }
     tor_free(ocirc->build_state);
 
@@ -1148,6 +1159,11 @@ circuit_free_(circuit_t *circ)
     /* Clear cell queue _after_ removing it from the map.  Otherwise our
      * "active" checks will be violated. */
     cell_queue_clear(&ocirc->p_chan_cells);
+
+#ifdef SPLIT_EVAL
+    split_eval_cell_free(ocirc->split_eval_data.merged_cells);
+    split_eval_cell_free(ocirc->split_eval_data.split_cells);
+#endif /* SPLIT_EVAL */
   }
 
   extend_info_free(circ->n_hop);
@@ -1268,7 +1284,7 @@ circuit_free_all(void)
 }
 
 /** Deallocate space associated with the cpath node <b>victim</b>. */
-static void
+void
 circuit_free_cpath_node(crypt_path_t *victim)
 {
   if (!victim)
@@ -1854,6 +1870,8 @@ circuit_find_to_cannibalize(uint8_t purpose_to_produce, extend_info_t *info,
    * cannibalization. */
   tor_assert(!(flags & CIRCLAUNCH_ONEHOP_TUNNEL));
 
+  tor_assert(!(flags & CIRCLAUNCH_DONT_CANNIBALIZE));
+
   purpose_to_search_for = get_circuit_purpose_needed_to_cannibalize(
                                                   purpose_to_produce);
 
@@ -2197,6 +2215,9 @@ circuit_mark_for_close_, (circuit_t *circ, int reason, int line,
   /* Notify the HS subsystem that this circuit is closing. */
   hs_circ_cleanup(circ);
 
+  /* Notify the split module that this circuit is closing. */
+  split_mark_for_close(circ, reason);
+
   if (circuits_pending_close == NULL)
     circuits_pending_close = smartlist_new();
 
@@ -2219,6 +2240,8 @@ circuit_mark_for_close_, (circuit_t *circ, int reason, int line,
 static void
 circuit_about_to_free_atexit(circuit_t *circ)
 {
+  /* print the evaluation data */
+  split_eval_print_circ(circ);
 
   if (circ->n_chan) {
     circuit_clear_cell_queue(circ, circ->n_chan);
@@ -2235,6 +2258,8 @@ circuit_about_to_free_atexit(circuit_t *circ)
       circuit_set_p_circid_chan(or_circ, 0, NULL);
     }
   }
+
+  split_remove_subcirc(circ, 1);
 }
 
 /** Called immediately before freeing a marked circuit <b>circ</b>.
@@ -2314,6 +2339,9 @@ circuit_about_to_free(circuit_t *circ)
     }
   }
 
+  /* print the evaluation data */
+  split_eval_print_circ(circ);
+
   if (circ->n_chan) {
     circuit_clear_cell_queue(circ, circ->n_chan);
     /* Only send destroy if the channel isn't closing anyway */
@@ -2362,6 +2390,9 @@ circuit_about_to_free(circuit_t *circ)
       connection_edge_destroy(circ->n_circ_id, conn);
     ocirc->p_streams = NULL;
   }
+
+  /* Remove circ from all split_data structures it is associated with */
+  split_remove_subcirc(circ, 0);
 }
 
 /** Given a marked circuit <b>circ</b>, aggressively free its cell queues to
@@ -2553,12 +2584,21 @@ circuit_max_queued_data_age(const circuit_t *c, uint32_t now)
 STATIC uint32_t
 circuit_max_queued_item_age(const circuit_t *c, uint32_t now)
 {
+  uint32_t max_age = 0;
   uint32_t cell_age = circuit_max_queued_cell_age(c, now);
   uint32_t data_age = circuit_max_queued_data_age(c, now);
-  if (cell_age > data_age)
-    return cell_age;
-  else
-    return data_age;
+  uint32_t split_age = split_max_buffered_cell_age(c, now);
+
+  if (cell_age > max_age)
+    max_age = cell_age;
+
+  if (data_age > max_age)
+    max_age = data_age;
+
+  if (split_age > max_age)
+    max_age = split_age;
+
+  return max_age;
 }
 
 /** Helper to sort a list of circuit_t by age of oldest item, in descending
@@ -2617,6 +2657,7 @@ circuits_handle_oom(size_t current_allocation)
   uint32_t now_ts;
   log_notice(LD_GENERAL, "We're low on memory (cell queues total alloc:"
              " %"TOR_PRIuSZ" buffer total alloc: %" TOR_PRIuSZ ","
+             "slit buffer total alloc: %" TOR_PRIuSZ ","
              " tor compress total alloc: %" TOR_PRIuSZ
              " (zlib: %" TOR_PRIuSZ ", zstd: %" TOR_PRIuSZ ","
              " lzma: %" TOR_PRIuSZ "),"
@@ -2625,6 +2666,7 @@ circuits_handle_oom(size_t current_allocation)
              " MaxMemInQueues.)",
              cell_queues_get_total_allocation(),
              buf_get_total_allocation(),
+             split_cell_buffer_get_total_allocation(),
              tor_compress_get_total_allocation(),
              tor_zlib_get_total_allocation(),
              tor_zstd_get_total_allocation(),
@@ -2702,6 +2744,7 @@ circuits_handle_oom(size_t current_allocation)
     }
     marked_circuit_free_cells(circ);
     freed = marked_circuit_free_stream_bytes(circ);
+    freed += split_marked_circuit_free_buffer(circ);
 
     ++n_circuits_killed;
 

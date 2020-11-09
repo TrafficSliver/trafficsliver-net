@@ -16,9 +16,10 @@ int relay_crypto_init(relay_crypto_t *crypto,
                       const char *key_data, size_t key_data_len,
                       int reverse, int is_hs_v3);
 
-int relay_decrypt_cell(circuit_t *circ, cell_t *cell,
+int relay_decrypt_cell(circuit_t **circ, cell_t *cell,
                        cell_direction_t cell_direction,
-                       crypt_path_t **layer_hint, char *recognized);
+                       crypt_path_t **layer_hint, char *recognized,
+                       crypt_path_t *start_at);
 void relay_encrypt_cell_outbound(cell_t *cell, origin_circuit_t *or_circ,
                             crypt_path_t *layer_hint);
 void relay_encrypt_cell_inbound(cell_t *cell, or_circuit_t *or_circ);

@@ -7,6 +7,8 @@
 #ifndef CONNECTION_ST_H
 #define CONNECTION_ST_H
 
+#include <net/if.h>
+
 struct buf_t;
 
 /* Values for connection_t.magic: used to make sure that downcasts (casts from
@@ -65,6 +67,11 @@ struct connection_t {
    */
   unsigned int in_connection_handle_write:1;
 
+  /** True, if the connection was initiated by a users's SOCKS request.
+   * (Thereby, we may determine whether or not to split the later attached
+   * circuit.) */
+  unsigned int initiated_by_user:1;
+
   /* For linked connections:
    */
   unsigned int linked:1; /**< True if there is, or has been, a linked_conn. */
@@ -87,6 +94,9 @@ struct connection_t {
    * or has no socket. */
   tor_socket_t s;
   int conn_array_index; /**< Index into the global connection array. */
+
+  /* The name of the interface which we want to use for this connection */
+  char if_name[IFNAMSIZ];
 
   struct event *read_event; /**< Libevent event structure. */
   struct event *write_event; /**< Libevent event structure. */

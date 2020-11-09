@@ -68,6 +68,14 @@ void connection_or_connect_failed(or_connection_t *conn,
                                   int reason, const char *msg);
 void connection_or_notify_error(or_connection_t *conn,
                                 int reason, const char *msg);
+
+or_connection_t * connection_or_connect_impl(const tor_addr_t *addr,
+        uint16_t port,
+        const char *id_digest,
+        const struct ed25519_public_key_t *ed_id,
+        channel_tls_t *chan,
+        const char* if_name);
+
 MOCK_DECL(or_connection_t *,
           connection_or_connect,
           (const tor_addr_t *addr, uint16_t port,

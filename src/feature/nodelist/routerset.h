@@ -37,6 +37,8 @@ void routerset_get_all_nodes(smartlist_t *out, const routerset_t *routerset,
 int routerset_add_unknown_ccs(routerset_t **setp, int only_if_some_cc_set);
 void routerset_subtract_nodes(smartlist_t *out,
                                 const routerset_t *routerset);
+void routerset_intersect_nodes(smartlist_t *out,
+                                 const routerset_t *routerset);
 
 char *routerset_to_string(const routerset_t *routerset);
 int routerset_equal(const routerset_t *old, const routerset_t *new);

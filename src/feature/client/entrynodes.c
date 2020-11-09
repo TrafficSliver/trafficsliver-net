@@ -138,6 +138,7 @@
 #include "feature/nodelist/node_select.h"
 #include "feature/nodelist/routerset.h"
 #include "feature/relay/router.h"
+#include "feature/split/splitdefines.h"
 #include "lib/crypt_ops/crypto_rand.h"
 #include "lib/crypt_ops/digestset.h"
 #include "lib/encoding/confline.h"
@@ -145,6 +146,7 @@
 
 #include "feature/nodelist/node_st.h"
 #include "core/or/origin_circuit_st.h"
+#include "core/or/cpath_build_state_st.h"
 #include "app/config/or_state_st.h"
 
 /** A list of existing guard selection contexts. */
@@ -161,9 +163,6 @@ static void entry_guard_set_filtered_flags(const or_options_t *options,
                                            entry_guard_t *guard);
 static void pathbias_check_use_success_count(entry_guard_t *guard);
 static void pathbias_check_close_success_count(entry_guard_t *guard);
-static int node_is_possible_guard(const node_t *node);
-static int node_passes_guard_filter(const or_options_t *options,
-                                    const node_t *node);
 static entry_guard_t *entry_guard_add_to_sample_impl(guard_selection_t *gs,
                                const uint8_t *rsa_id_digest,
                                const char *nickname,
@@ -455,6 +454,8 @@ get_guard_confirmed_min_lifetime(void)
 STATIC int
 get_n_primary_guards(void)
 {
+  int retval;
+
   /* If the user has explicitly configured the number of primary guards, do
    * what the user wishes to do */
   const int configured_primaries = get_options()->NumPrimaryGuards;
@@ -464,9 +465,17 @@ get_n_primary_guards(void)
 
   /* otherwise check for consensus parameter and if that's not set either, just
    * use the default value. */
-  return networkstatus_get_param(NULL,
-                                 "guard-n-primary-guards",
-                                 DFLT_N_PRIMARY_GUARDS, 1, INT32_MAX);
+  retval = networkstatus_get_param(NULL,
+                                   "guard-n-primary-guards",
+                                   DFLT_N_PRIMARY_GUARDS, 1, INT32_MAX);
+
+#ifdef HAVE_MODULE_SPLIT
+  /* we need to use more primary guards, if the split module is activated */
+  if (retval < SPLIT_MIN_NUM_PRIMARY_GUARDS)
+    retval = SPLIT_MIN_NUM_PRIMARY_GUARDS;
+#endif /* HAVE_MODULE_SPLIT */
+
+  return retval;
 }
 /**
  * Return the number of the live primary guards we should look at when
@@ -758,7 +767,7 @@ update_guard_selection_choice(const or_options_t *options)
  * Return true iff <b>node</b> has all the flags needed for us to consider it
  * a possible guard when sampling guards.
  */
-static int
+int
 node_is_possible_guard(const node_t *node)
 {
   /* The "GUARDS" set is all nodes in the nodelist for which this predicate
@@ -1443,18 +1452,29 @@ sampled_guards_update_from_consensus(guard_selection_t *gs)
 /**
  * Return true iff <b>node</b> is a Tor relay that we are configured to
  * be able to connect to. */
-static int
+int
 node_passes_guard_filter(const or_options_t *options,
                          const node_t *node)
 {
   /* NOTE: Make sure that this function stays in sync with
    * options_transition_affects_entry_guards */
+  if (options->SplitEntryNodes &&
+        routerset_contains_node(options->SplitEntryNodes, node))
+      return 1;
+
   if (routerset_contains_node(options->ExcludeNodes, node))
     return 0;
 
   if (options->EntryNodes &&
       !routerset_contains_node(options->EntryNodes, node))
     return 0;
+
+  if (options->SplitMiddleNodes &&
+      routerset_contains_node(options->SplitMiddleNodes, node))
+    return 0;
+  if (options->SplitExitNodes &&
+        routerset_contains_node(options->SplitExitNodes, node))
+      return 0;
 
   if (!fascist_firewall_allows_node(node, FIREWALL_OR_CONNECTION, 0))
     return 0;
@@ -1565,6 +1585,19 @@ guard_create_exit_restriction(const uint8_t *exit_id)
   return rst;
 }
 
+/* Allocate and return a new split guard restriction based on the
+ * <b>excluded</b> list.
+ */
+static entry_guard_restriction_t*
+guard_create_split_restriction(const smartlist_t* excluded)
+{
+  entry_guard_restriction_t* rst = NULL;
+  rst = tor_malloc_zero(sizeof(entry_guard_restriction_t));
+  rst->type = RST_SPLIT;
+  rst->excluded = excluded;
+  return rst;
+}
+
 /** If we have fewer than this many possible usable guards, don't set
  * MD-availability-based restrictions: we might blacklist all of them. */
 #define MIN_GUARDS_FOR_MD_RESTRICTION 10
@@ -1641,6 +1674,25 @@ guard_obeys_md_dirserver_restriction(const entry_guard_t *guard)
   return 1;
 }
 
+/* Return True if <b>guard</b> obeys the split restriction <b>rst</b>. */
+static int
+guard_obeys_split_restriction(const entry_guard_t* guard,
+                              const entry_guard_restriction_t* rst)
+{
+  tor_assert(rst->type == RST_SPLIT);
+  tor_assert(rst->excluded);
+
+  SMARTLIST_FOREACH_BEGIN(rst->excluded, node_t*, node) {
+
+    tor_assert(node);
+    if (tor_memeq(guard->identity, node->identity, DIGEST_LEN))
+      return 0;
+
+  } SMARTLIST_FOREACH_END(node);
+
+  return 1;
+}
+
 /**
  * Return true iff <b>guard</b> obeys the restrictions defined in <b>rst</b>.
  * (If <b>rst</b> is NULL, there are no restrictions.)
@@ -1657,6 +1709,8 @@ entry_guard_obeys_restriction(const entry_guard_t *guard,
     return guard_obeys_exit_restriction(guard, rst);
   } else if (rst->type == RST_OUTDATED_MD_DIRSERVER) {
     return guard_obeys_md_dirserver_restriction(guard);
+  } else if (rst->type == RST_SPLIT) {
+    return guard_obeys_split_restriction(guard, rst);
   }
 
   tor_assert_nonfatal_unreached();
@@ -2339,6 +2393,7 @@ entry_guard_has_higher_priority(entry_guard_t *a, entry_guard_t *b)
 STATIC void
 entry_guard_restriction_free_(entry_guard_restriction_t *rst)
 {
+  /* rst->excluded must <em>not</em> be freed */
   tor_free(rst);
 }
 
@@ -2409,6 +2464,10 @@ entry_guard_pick_for_circuit(guard_selection_t *gs,
   if (BUG(usage != GUARD_USAGE_DIRGUARD &&
           !node_has_preferred_descriptor(node, 1)))
     goto fail;
+
+  /* prevent dangling pointers */
+  if (rst)
+    rst->excluded = NULL;
 
   *chosen_node_out = node;
   *guard_state_out = circuit_guard_state_new(guard, state, rst);
@@ -3633,8 +3692,13 @@ guards_choose_guard(cpath_build_state_t *state,
 
   /* Only apply restrictions if we have a specific exit node in mind, and only
    * if we are not doing vanguard circuits: we don't want to apply guard
-   * restrictions to vanguard circuits. */
-  if (state && !circuit_should_use_vanguards(purpose) &&
+   * restrictions to vanguard circuits.
+   * Also apply restrictions if state->split_excluded_nodes is set (due to
+   * already existing nodes in a split circuit. */
+  if (state && state->split_excluded_nodes) {
+    rst = guard_create_split_restriction(state->split_excluded_nodes);
+    tor_assert(rst);
+  } else if (state && !circuit_should_use_vanguards(purpose) &&
       (exit_id = build_state_get_exit_rsa_id(state))) {
     /* We're building to a targeted exit node, so that node can't be
      * chosen as our guard for this circuit.  Remember that fact in a

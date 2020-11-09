@@ -111,10 +111,11 @@ test_relaycrypt_outbound(void *arg)
     for (j = 0; j < 3; ++j) {
       crypt_path_t *layer_hint = NULL;
       char recognized = 0;
-      int r = relay_decrypt_cell(TO_CIRCUIT(cs->or_circ[j]),
+      circuit_t* circ = TO_CIRCUIT(cs->or_circ[j]);
+      int r = relay_decrypt_cell(&circ,
                                  &encrypted,
                                  CELL_DIRECTION_OUT,
-                                 &layer_hint, &recognized);
+                                 &layer_hint, &recognized, NULL);
       tt_int_op(r, OP_EQ, 0);
       tt_ptr_op(layer_hint, OP_EQ, NULL);
       tt_int_op(recognized != 0, OP_EQ, j == 2);
@@ -156,19 +157,21 @@ test_relaycrypt_inbound(void *arg)
     char recognized = 0;
     int r;
     for (j = 1; j >= 0; --j) {
-      r = relay_decrypt_cell(TO_CIRCUIT(cs->or_circ[j]),
+      circuit_t* circ = TO_CIRCUIT(cs->or_circ[j]);
+      r = relay_decrypt_cell(&circ,
                              &encrypted,
                              CELL_DIRECTION_IN,
-                             &layer_hint, &recognized);
+                             &layer_hint, &recognized, NULL);
       tt_int_op(r, OP_EQ, 0);
       tt_ptr_op(layer_hint, OP_EQ, NULL);
       tt_int_op(recognized, OP_EQ, 0);
     }
 
-    relay_decrypt_cell(TO_CIRCUIT(cs->origin_circ),
+    circuit_t* circ = TO_CIRCUIT(cs->origin_circ);
+    relay_decrypt_cell(&circ,
                        &encrypted,
                        CELL_DIRECTION_IN,
-                       &layer_hint, &recognized);
+                       &layer_hint, &recognized, NULL);
     tt_int_op(r, OP_EQ, 0);
     tt_int_op(recognized, OP_EQ, 1);
     tt_ptr_op(layer_hint, OP_EQ, cs->origin_circ->cpath->prev);

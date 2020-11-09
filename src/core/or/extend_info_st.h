@@ -9,6 +9,7 @@
 
 #include "lib/crypt_ops/crypto_curve25519.h"
 #include "lib/crypt_ops/crypto_ed25519.h"
+#include "feature/split/splitdefines.h"
 
 /** Information on router used when extending a circuit. We don't need a
  * full routerinfo_t to extend: we only need addr:port:keyid to build an OR
@@ -25,6 +26,13 @@ struct extend_info_t {
   tor_addr_t addr; /**< IP address. */
   crypto_pk_t *onion_key; /**< Current onionskin key. */
   curve25519_public_key_t curve25519_onion_key;
+
+  /** pointer to the split_data structure we are currently extending.
+   * WARNING: Only used to get this information into the circuit-build
+   * functions! Don't use for other purposes! Would create dangling pointer,
+   * if split_data was freed in the meantime (unlikely, but not thread-safe)
+   */
+  split_data_t* split_data;
 };
 
 #endif

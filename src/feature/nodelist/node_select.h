@@ -17,6 +17,8 @@ typedef enum router_crn_flags_t {
   CRN_NEED_UPTIME = 1<<0,
   CRN_NEED_CAPACITY = 1<<1,
   CRN_NEED_GUARD = 1<<2,
+  /* Only allow choosing nodes that could be used as Guard nodes */
+  CRN_NEED_GUARD_STRICT = 1<<3,
   /* XXXX not used, apparently. */
   CRN_WEIGHT_AS_EXIT = 1<<5,
   CRN_NEED_DESC = 1<<6,
@@ -76,6 +78,12 @@ const node_t *node_sl_choose_by_bandwidth(const smartlist_t *sl,
 double frac_nodes_with_descriptors(const smartlist_t *sl,
                                    bandwidth_weight_rule_t rule,
                                    int for_direct_conn);
+
+const node_t *router_choose_random_node_impl(smartlist_t *excludedsmartlist,
+                                            struct routerset_t *excludedset,
+                                            struct routerset_t *restrictedset,
+                                            router_crn_flags_t flags);
+
 const node_t *router_choose_random_node(smartlist_t *excludedsmartlist,
                                         struct routerset_t *excludedset,
                                         router_crn_flags_t flags);

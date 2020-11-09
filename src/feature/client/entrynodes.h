@@ -280,7 +280,9 @@ typedef enum guard_restriction_type_t {
   /* Don't pick the same guard node as our exit node (or its family) */
   RST_EXIT_NODE = 0,
   /* Don't pick dirguards that have previously shown to be outdated */
-  RST_OUTDATED_MD_DIRSERVER = 1
+  RST_OUTDATED_MD_DIRSERVER = 1,
+  /* Don't pick nodes that already have been used in the same split circuit */
+  RST_SPLIT = 2,
 } guard_restriction_type_t;
 
 /**
@@ -298,6 +300,10 @@ struct entry_guard_restriction_t {
    * digest must not equal this; and it must not be in the same family as any
    * node with this digest. */
   uint8_t exclude_id[DIGEST_LEN];
+
+  /* In case of restriction type RST_SPLIT, the guards node_t representation
+   * must not be included in this list. */
+  const smartlist_t* excluded;
 };
 
 /**
@@ -328,6 +334,9 @@ const node_t *guards_choose_guard(cpath_build_state_t *state,
                                   circuit_guard_state_t **guard_state_out);
 const node_t *guards_choose_dirguard(uint8_t dir_purpose,
                                      circuit_guard_state_t **guard_state_out);
+
+int node_is_possible_guard(const node_t *node);
+int node_passes_guard_filter(const or_options_t *options, const node_t *node);
 
 #if 1
 /* XXXX NM I would prefer that all of this stuff be private to
@@ -413,7 +422,7 @@ MOCK_DECL(int,num_bridges_usable,(int use_maybe_reachable));
 /**
  * We always try to make our sample contain at least this many guards.
  */
-#define DFLT_MIN_FILTERED_SAMPLE_SIZE 20
+#define DFLT_MIN_FILTERED_SAMPLE_SIZE 20 //wdlc: it should be 5
 /**
  * If a guard is unlisted for this many days in a row, we remove it.
  */

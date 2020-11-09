@@ -1,0 +1,89 @@
+
+TrafficSliver-Net Traffic Splitting
+===================================
+
+This file contains information on building and setting up the TrafficSliver-Net [1]
+traffic splitting extension to the Tor software.
+
+(For information on the Tor software in general, please refer to the original "README"
+ file in this directory.)
+
+
+--- 1) Source code and integration with Tor
+
+The TrafficSliver-Net traffic splitting extension is implemented as a new module named
+'split', extending the original Tor software (cf. doc/HACKING/module.md). As such, all
+its relevant source code files are placed in the src/feature/split sub-directory.
+
+However, due to the tight integration with the remaining Tor software, important parts
+of the splitting implementation are situated directly in the original Tor source files;
+e.g., in src/core/or/[circuitbuild.c|circuituse.c|origin_circuit_st.h|relay.c|...]
+
+
+
+--- 2) Building Tor with the 'split' module
+
+The 'split' module is configured to be *automatically enabled* when building this
+version of the Tor software. Thus, for building Tor with the 'split' module activated,
+simply follow the building instructions given in the original "README" file in this
+directory.
+
+To *disable* the 'split' module and revert Tor to its original behaviour, pass the
+option "--disable-module-split" to the ./configure script and, then, re-build Tor.
+
+Further configure-time configurations and options are not yet supported.
+
+
+
+--- 3) Compile-time configuration of the 'split' module
+
+The 'split' module is mainly configured through a set of pre-processor macros that can
+be found accompanied by a brief description in the file src/feature/split/splitdefines.h.
+
+
+
+--- 4) Run-time configuration of the 'split' module
+
+Next to the compile-time configuration, some aspects of the 'split' module can
+additionally be configured at run-time by inserting appropriate options into the
+torrc configuration file.
+
+The currently supported torrc-options are:
+
+  * Split[Entry|Middle|Exit]Nodes    provide a list of identity fingerprints and force Tor
+                                     to use the corresponding ORs as entry/middle/exit ORs
+                                     for building user-initiated split circuits
+                                     (default: none)
+
+  * SplitSubcircuits                 set the number of overall sub-circuits to use per
+                                     split circuit; overwrites the value defined in
+                                     "splitdefaults.h" (default: 3)
+
+  * SplitStrategy                    set the splitting strategy to be used by the client
+                                     and the middle node; choose from {MIN_ID, MAX_ID,
+                                     ROUND_ROBIN, RANDOM_UNIFORM, WEIGHTED_RANDOM,
+                                     BATCHED_WEIGHTED_RANDOM} (default: ROUND_ROBIN)
+
+
+
+--- 5) Performance evaluation
+
+For providing the performance evaluation results used in the TrafficSliver CCS Paper [1],
+the 'split' module implementation has been instrumented with evaluation code that can be
+enabled and disabled at compile-time via pre-processor macros.
+
+The code base is situated in the src/feature/split/spliteval[.c|.h] files and supports a
+circuit-setup measurement mode (SPLIT_EVAL_CIRCBUILD) and a data-transmission measurement
+mode (SPLIT_EVAL_DATARATE). During the performance evaluation measurement runs, monotonic
+timestamps are captured at significant positions in the control flow and later dumped to
+the log files.
+
+
+
+--- *) References
+
+[1]   W. De la Cadena, A. Mitseva, J. Hiller, J. Pennekamp, S. Reuter, J. Filter,
+      K. Wehrle, T. Engel, and A. Panchenko. Traffic sliver: Fighting website
+      fingerprinting attacks with traffic splitting. In Proceedings of the 2020 ACM
+      SIGSAC Conference on Computer and Communications Security, CCS ’20, New York, NY,
+      USA, 2020.

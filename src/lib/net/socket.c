@@ -19,6 +19,9 @@
 #include "lib/log/log.h"
 #include "lib/log/util_bug.h"
 
+#include "feature/split/splitdefines.h"
+#include <netinet/tcp.h>
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
@@ -293,6 +296,22 @@ tor_open_socket_with_extensions(int domain, int type, int protocol,
   goto socket_ok; /* So that socket_ok will not be unused. */
 
  socket_ok:
+
+#if defined(SPLIT_DISABLE_NAGLE)
+  log_debug(LD_FS, "Try to disable Nagle's Algorithm for socket %d "
+            "(domain %d, type %d)", s, domain, type);
+  if ((domain == AF_INET || domain == AF_INET6) && type == SOCK_STREAM) {
+    int flags = 1;
+    if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (void *)&flags, sizeof(flags))
+        == -1) {
+      log_warn(LD_FS, "Couldn't set TCP_NODELAY: %s", strerror(errno));
+      tor_close_socket_simple(s);
+      return TOR_INVALID_SOCKET;
+    }
+    log_debug(LD_FS, "Disabled Nagle's Algorithm for socket %d", s);
+  }
+#endif /* defined(SPLIT_DISABLE_NAGLE) */
+
   tor_take_socket_ownership(s);
   return s;
 }

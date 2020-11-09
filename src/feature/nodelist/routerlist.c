@@ -102,6 +102,7 @@
 #include "feature/nodelist/routerinfo_st.h"
 #include "feature/nodelist/routerlist_st.h"
 #include "feature/nodelist/vote_routerstatus_st.h"
+#include "feature/client/entrynodes.h"
 
 #include "lib/crypt_ops/digestset.h"
 
@@ -503,8 +504,8 @@ routers_have_same_or_addrs(const routerinfo_t *r1, const routerinfo_t *r2)
 void
 router_add_running_nodes_to_smartlist(smartlist_t *sl, int need_uptime,
                                       int need_capacity, int need_guard,
-                                      int need_desc, int pref_addr,
-                                      int direct_conn)
+                                      int need_guard_strict, int need_desc,
+                                      int pref_addr, int direct_conn)
 {
   const int check_reach = !router_skip_or_reachability(get_options(),
                                                        pref_addr);
@@ -517,6 +518,9 @@ router_add_running_nodes_to_smartlist(smartlist_t *sl, int need_uptime,
     if (node->ri && node->ri->purpose != ROUTER_PURPOSE_GENERAL)
       continue;
     if (node_is_unreliable(node, need_uptime, need_capacity, need_guard))
+      continue;
+    if (need_guard_strict && (!node_is_possible_guard(node) ||
+        !node_passes_guard_filter(get_options(),node)))
       continue;
     /* Don't choose nodes if we are certain they can't do EXTEND2 cells */
     if (node->rs && !routerstatus_version_supports_extend2_cells(node->rs, 1))
@@ -3227,6 +3231,14 @@ refresh_all_country_info(void)
     routerset_refresh_countries(options->EntryNodes);
   if (options->ExitNodes)
     routerset_refresh_countries(options->ExitNodes);
+  if (options->MiddleNodes)
+    routerset_refresh_countries(options->MiddleNodes);
+  if (options->SplitEntryNodes)
+      routerset_refresh_countries(options->SplitEntryNodes);
+  if (options->SplitMiddleNodes)
+    routerset_refresh_countries(options->SplitMiddleNodes);
+  if (options->SplitExitNodes)
+      routerset_refresh_countries(options->SplitExitNodes);
   if (options->ExcludeNodes)
     routerset_refresh_countries(options->ExcludeNodes);
   if (options->ExcludeExitNodes)
